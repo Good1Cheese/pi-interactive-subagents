@@ -1,5 +1,6 @@
 {
   "status": {
     "enabled": true
-  }
+  },
+  "childExtensions": []
 }
