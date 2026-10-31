@@ -57,7 +57,6 @@ function simulateRouting(
 // --- Fixtures ---
 
 const AGENT_REPLACE = `---
-model: anthropic/claude-sonnet-4-20250514
 system-prompt: replace
 auto-exit: true
 ---
@@ -65,20 +64,18 @@ auto-exit: true
 You are a specialized agent.`;
 
 const AGENT_APPEND = `---
-model: anthropic/claude-sonnet-4-20250514
 system-prompt: append
 ---
 
 You are an appended identity.`;
 
 const AGENT_DEFAULT = `---
-model: anthropic/claude-sonnet-4-20250514
+name: test-default
 ---
 
 You are a default agent.`;
 
 const AGENT_INVALID = `---
-model: anthropic/claude-sonnet-4-20250514
 system-prompt: foobar
 ---
 

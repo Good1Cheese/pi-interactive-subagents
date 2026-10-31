@@ -1,7 +1,5 @@
 import {
-  appendFileSync,
   closeSync,
-  copyFileSync,
   existsSync,
   mkdirSync,
   openSync,
@@ -10,10 +8,10 @@ import {
   readdirSync,
   renameSync,
   statSync,
-  writeFileSync,
 } from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
+import { appendPrivateFile, ensurePrivateDir, writePrivateFile } from "./private-files.ts";
 
 export interface SessionEntry {
   type: string;
@@ -77,7 +75,7 @@ export function seedSubagentSessionFile(params: {
   const lines = [JSON.stringify(header), ...contentLines];
 
   mkdirSync(dirname(params.childSessionFile), { recursive: true });
-  writeFileSync(params.childSessionFile, lines.join("\n") + "\n", "utf8");
+  writePrivateFile(params.childSessionFile, lines.join("\n") + "\n");
 }
 
 /**
@@ -98,6 +96,9 @@ export interface SubagentLoadout {
   agent: string | null;
   /** The `--tools` allowlist string, or null when the spawn was unrestricted. */
   toolAllowlist: string | null;
+  /** Explicit provider/security extension paths, fixed at launch. */
+  extensionAllowlist?: string[];
+  toolExtensions?: string[];
   /** Model id (without thinking suffix), or null to use the session default. */
   model: string | null;
   /** Thinking level appended to the model as `model:level`, or null. */
@@ -123,12 +124,7 @@ export function loadoutSidecarPath(sessionFile: string): string {
 
 /** Persist a subagent's resolved sandbox loadout beside its session file. */
 export function writeSubagentLoadout(sessionFile: string, loadout: SubagentLoadout): void {
-  try {
-    writeFileSync(loadoutSidecarPath(sessionFile), JSON.stringify(loadout), "utf8");
-  } catch {
-    // Best-effort: a missing snapshot only means resume will refuse, never that
-    // it launches unrestricted.
-  }
+  writePrivateFile(loadoutSidecarPath(sessionFile), JSON.stringify(loadout));
 }
 
 /** Read a subagent's loadout snapshot, or null if absent/unparseable. */
@@ -191,12 +187,12 @@ export function registerName(
   entry: NameRegistryEntry,
 ): void {
   try {
-    mkdirSync(artifactDir, { recursive: true });
-    const registry = readNameRegistry(artifactDir);
+    ensurePrivateDir(artifactDir);
+    const registry = Object.assign(Object.create(null), readNameRegistry(artifactDir));
     registry[name] = entry;
     const p = nameRegistryPath(artifactDir);
     const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
-    writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
+    writePrivateFile(tmp, JSON.stringify(registry, null, 2));
     renameSync(tmp, p);
   } catch {
     // Best-effort: a failed registration only means resume-by-name won't find
@@ -519,7 +515,7 @@ export function appendBranchSummary(
     fromId: fromId ?? branchPointId,
     summary,
   };
-  appendFileSync(sessionFile, JSON.stringify(entry) + "\n", "utf8");
+  appendPrivateFile(sessionFile, JSON.stringify(entry) + "\n");
   return id;
 }
 
@@ -530,7 +526,7 @@ export function appendBranchSummary(
 export function copySessionFile(sessionFile: string, destDir: string): string {
   const id = randomBytes(4).toString("hex");
   const dest = join(destDir, `subagent-${id}.jsonl`);
-  copyFileSync(sessionFile, dest);
+  writePrivateFile(dest, readFileSync(sessionFile, "utf8"));
   return dest;
 }
 
@@ -545,7 +541,7 @@ export function mergeNewEntries(
 ): SessionEntry[] {
   const entries = getNewEntries(sourceFile, afterLine);
   for (const entry of entries) {
-    appendFileSync(targetFile, JSON.stringify(entry) + "\n", "utf8");
+    appendPrivateFile(targetFile, JSON.stringify(entry) + "\n");
   }
   return entries;
 }

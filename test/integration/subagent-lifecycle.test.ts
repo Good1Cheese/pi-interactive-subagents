@@ -1,7 +1,7 @@
 /**
  * Integration tests for the full subagent lifecycle.
  *
- * These tests spawn REAL pi sessions with REAL LLM calls (haiku by default).
+ * These tests spawn REAL pi sessions with REAL LLM calls (Codex by default).
  * Each test creates a tmux pane, runs pi with a task that uses the subagent
  * tool, and verifies the outcome via marker files and screen output.
  *
@@ -12,7 +12,8 @@
  *   tmux new 'npm run test:integration'
  *
  * Configuration:
- *   PI_TEST_MODEL     — model for all pi sessions (default: anthropic/claude-haiku-4-5)
+ *   PI_TEST_MODEL     — model for all pi sessions (default: openai-codex/gpt-6.1-sol)
+ *   PI_TEST_PI        — absolute Pi binary path, also prepended to child PATH
  *   PI_TEST_TIMEOUT   — per-test timeout in ms (default: 120000)
  */
 import { describe, it, before, after } from "node:test";
@@ -24,6 +25,7 @@ import {
   cleanupTestEnv,
   createTrackedSurface,
   startPi,
+  sendCommand,
   waitForScreen,
   waitForFile,
   sleep,
@@ -101,6 +103,42 @@ for (const backend of backends) {
         assert.equal(header.type, "session", "First entry should be session header");
         assert.ok(header.id, "Session header should have an id");
       }
+    });
+
+    it("resumes a finished named child with its original loadout", async () => {
+      const id = uniqueId();
+      const first = `/tmp/pi-integ-first-${id}.txt`;
+      const second = `/tmp/pi-integ-resume-${id}.txt`;
+      trackTempFile(env, first);
+      trackTempFile(env, second);
+      const surface = createTrackedSurface(env, `resume-${id}`);
+      await sleep(1000);
+      startPi(surface, env.dir, [
+        `Call subagent with agent "test-echo", name "Resume-${id}", task "Run echo first > ${first}".`,
+        `After its result arrives, call subagent_message with name "Resume-${id}" and message "Run echo second > ${second}".`,
+        `After the resumed result arrives say RESUME_COMPLETE.`,
+      ].join("\n"));
+      await waitForFile(first, PI_TIMEOUT, /first/);
+      await waitForFile(second, PI_TIMEOUT, /second/);
+      await waitForScreen(surface, /RESUME_COMPLETE|resumed/i, PI_TIMEOUT);
+    });
+
+    it("keeps observing a live child across parent reload", async () => {
+      const id = uniqueId();
+      const started = `/tmp/pi-integ-reload-start-${id}.txt`;
+      const finished = `/tmp/pi-integ-reload-finish-${id}.txt`;
+      const delivered = `/tmp/pi-integ-reload-delivered-${id}.txt`;
+      for (const file of [started, finished, delivered]) trackTempFile(env, file);
+      const surface = createTrackedSurface(env, `reload-${id}`);
+      await sleep(1000);
+      startPi(surface, env.dir, [
+        `Call subagent with agent "test-echo", name "Reload-${id}", task "Use bash to run: echo started > ${started}; sleep 20; echo finished > ${finished}".`,
+        `Wait for the subagent result. Only AFTER receiving its result, use bash to run: echo delivered > ${delivered}.`,
+      ].join("\n"));
+      await waitForFile(started, PI_TIMEOUT, /started/);
+      sendCommand(surface, "/reload");
+      await waitForFile(finished, PI_TIMEOUT, /finished/);
+      await waitForFile(delivered, PI_TIMEOUT, /delivered/);
     });
 
     // ── In-progress activity snapshots ──

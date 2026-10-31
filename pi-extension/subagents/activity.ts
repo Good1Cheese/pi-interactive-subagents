@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, unlinkSync } from "node:fs";
+import { ensurePrivateDir, writePrivateFile } from "./private-files.ts";
 import { dirname, join } from "node:path";
 
 export type SubagentActivityPhase = "starting" | "active" | "waiting" | "done";
@@ -201,11 +202,11 @@ export function readSubagentActivityFile(
 
 export function writeSubagentActivityFile(activityFile: string, activity: SubagentActivityState): void {
   const dir = dirname(activityFile);
-  mkdirSync(dir, { recursive: true });
+  ensurePrivateDir(dir);
   const tempFile = join(dir, `${activity.runningChildId}.json.${process.pid}.${activity.sequence}.tmp`);
 
   try {
-    writeFileSync(tempFile, `${JSON.stringify(activity)}\n`, "utf8");
+    writePrivateFile(tempFile, `${JSON.stringify(activity)}\n`);
     renameSync(tempFile, activityFile);
   } catch (error) {
     try {
@@ -331,7 +332,7 @@ export function createSubagentActivityRecorder(params: {
   function flushNow(): void {
     if (disabled) return;
     try {
-      writeSubagentActivityFile(activityFile, activity);
+      writeSubagentActivityFile(activityFile!, activity);
       lastFlushAt = now();
       failureCount = 0;
     } catch {

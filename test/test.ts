@@ -4,8 +4,10 @@ import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { visibleWidth } from "@mariozechner/pi-tui";
-import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import { visibleWidth } from "@earendil-works/pi-tui";
+// Tests model a top-level session even when run from a restricted child.
+delete process.env.PI_SUBAGENT_ALLOWED;
+const subagentsModule = await import("../pi-extension/subagents/index.ts");
 
 import {
   getLeafId,
@@ -1068,6 +1070,64 @@ describe("status.ts", () => {
 describe("subagent discovery", () => {
   const testApi = (subagentsModule as any).__test__;
 
+  it("normalizes list-valued tool, skill and spawn grants", () => {
+    const parsed = testApi.parseAgentDefinition('---\nname: arrays\ntools: [read, grep]\nsubagent_agents:\n  - scout\n  - researcher\nskills: [review, lint]\nauto-exit: true\nsession-mode: fork\n---\nbody', 'x');
+    assert.equal(parsed.tools, "read,grep");
+    assert.deepEqual(parsed.subagentAgents, ["scout", "researcher"]);
+    assert.equal(parsed.skills, "review,lint");
+    assert.equal(parsed.autoExit, true);
+    assert.equal(parsed.sessionMode, "fork");
+  });
+
+  it("fails closed on malformed security-sensitive fields", () => {
+    const invalid = [
+      'tools: null', 'tools: []', 'tools: ""', 'tools: [read, null]', 'tools: [read, ""]', 'tools: "read,,grep"', 'tools: "*"', 'tools: "-bash"', 'tools: false', 'tools: [read, subagent]',
+      'subagent_agents: null', 'subagent_agents: []', 'subagent_agents: [scout, 1]',
+      'auto-exit: nope', 'auto-exit: null', 'interactive: 1', 'disable-model-invocation: null',
+      'session-mode: nope', 'session-mode: null', 'system-prompt: null', 'system-prompt: nope',
+      'cli: other', 'cwd: null', 'skills: []', 'thinking: nonsense', 'extensions: ["/tmp/ext.ts"]',
+    ];
+    for (const field of invalid) {
+      assert.throws(() => testApi.parseAgentDefinition(`---\nname: bad\n${field}\n---\nbody`, "bad"), /Invalid agent field/, field);
+    }
+    assert.throws(() => testApi.parseAgentDefinition('---\nname: bad\nsystem-prompt: replace\n---\n', 'bad'), /profile body must not be empty/);
+    const missing = testApi.parseAgentDefinition('---\nname: absent\n---\nbody', 'x');
+    assert.equal(missing.tools, undefined);
+    assert.equal(testApi.buildSubagentToolAllowlist(missing.tools), null);
+    for (const config of [null, [], { childExtensions: null }, { childExtensions: "" }, { childExtensions: [null] }]) {
+      assert.throws(() => testApi.parseConfiguredExtensions(config));
+    }
+    assert.deepEqual(testApi.parseConfiguredExtensions({ childExtensions: [] }), []);
+  });
+
+  it("rejects control characters in labels", () => {
+    assert.equal(testApi.validSubagentName("safe-name"), true);
+    assert.equal(testApi.validSubagentName("name\necho injected"), false);
+    assert.equal(testApi.validSubagentName("name\r"), false);
+  });
+
+  it("parses quoted YAML and CRLF with project-over-global priority", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir, globalAgentsDir }) => {
+      writeFileSync(join(globalAgentsDir, "global.md"), '---\nname: "quoted-agent"\nmodel: "global/model"\ntools: read\n---\nGlobal');
+      writeFileSync(join(projectAgentsDir, "local.md"), '---\r\nname: "quoted-agent"\r\nmodel: "project/model"\r\ntools: "read, grep"\r\nauto-exit: true\r\n---\r\nProject');
+      const loaded = testApi.loadAgentDefaults("quoted-agent");
+      assert.equal(loaded?.model, "project/model");
+      assert.equal(loaded?.tools, "read,grep");
+      assert.equal(loaded?.autoExit, true);
+      assert.equal(loaded?.body, "Project");
+    });
+  });
+
+  it("loads by frontmatter name even when the filename differs", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(projectAgentsDir, "different-filename", "name: aliased-agent\ntools: read\nmodel: custom/model");
+      const loaded = testApi.loadAgentDefaults("aliased-agent");
+      assert.equal(loaded?.model, "custom/model");
+      assert.equal(loaded?.tools, "read");
+      assert.equal(testApi.loadAgentDefaults("different-filename"), null);
+    });
+  });
+
   it("loads session-mode from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -1209,13 +1269,13 @@ describe("subagent discovery", () => {
   it("getToolExtensionPath maps custom tools and skips built-ins", () => {
     assert.equal(testApi.getToolExtensionPath("read"), undefined);
     assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
+    // Optional web-search extension may not be installed.
     assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
     // Spawning tools are registered by this extension itself.
     assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
   });
 
-  it("ignores invalid session-mode values", async () => {
+  it("rejects invalid session-mode values", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
         projectAgentsDir,
@@ -1227,9 +1287,7 @@ describe("subagent discovery", () => {
         ].join("\n"),
       );
 
-      const loaded = testApi.loadAgentDefaults("invalid-mode-test-agent");
-      assert.ok(loaded, "expected agent to load");
-      assert.equal(loaded.sessionMode, undefined);
+      assert.throws(() => testApi.loadAgentDefaults("invalid-mode-test-agent"), /Invalid agent field "session-mode"/);
     });
   });
 
@@ -1281,7 +1339,8 @@ describe("subagent discovery", () => {
 
   it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
     assert.equal(testApi.buildSubagentToolAllowlist(undefined), null);
-    assert.equal(testApi.buildSubagentToolAllowlist(""), null);
+    assert.throws(() => testApi.buildSubagentToolAllowlist(""), /Invalid agent field/);
+    assert.equal(testApi.buildSubagentToolAllowlist(undefined, { grantSpawning: true }), "read,write,edit,bash,subagent,subagent_message,subagents_list,ask_question");
   });
 
   it("applySandboxToParts replays model, identity, and default-deny tool restriction", () => {
@@ -1344,10 +1403,10 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
+  it("buildPiPromptArgs keeps skills and task in a single run", () => {
     assert.deepEqual(
       testApi.buildPiPromptArgs({ effectiveSkills: "review,lint", taskDelivery: "artifact", taskArg: "@artifact.md" }),
-      ["", "/skill:review", "/skill:lint", "@artifact.md"],
+      ["@artifact.md"],
     );
   });
 
@@ -1361,7 +1420,7 @@ describe("subagent discovery", () => {
   it("buildPiPromptArgs omits separator for direct launches with skills", () => {
     assert.deepEqual(
       testApi.buildPiPromptArgs({ effectiveSkills: "review", taskDelivery: "direct", taskArg: "do the task" }),
-      ["/skill:review", "do the task"],
+      ["do the task"],
     );
   });
 
@@ -1694,7 +1753,9 @@ describe("subagent-done.ts", () => {
         // Reply arrives MID-RUN as a steer: input fires, no new agent_start.
         emit("input");
         let shutdown = false;
-        emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
+        emit("agent_end", { messages: [] });
+        assert.equal(shutdown, false, "agent_end is not a settlement boundary");
+        emit("agent_settled", { aborted: false }, { shutdown() { shutdown = true; } });
         assert.equal(shutdown, true, "reply consumed mid-run → agent_end should exit, not park");
       } finally {
         restore();
@@ -1710,7 +1771,8 @@ describe("subagent-done.ts", () => {
         await ask();
         // No input yet — the orchestrator has not replied.
         let shutdown = false;
-        emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
+        emit("agent_end", { messages: [] });
+        emit("agent_settled", { aborted: false }, { shutdown() { shutdown = true; } });
         assert.equal(shutdown, false, "pending question with no reply must park, not exit");
       } finally {
         restore();
@@ -1725,13 +1787,15 @@ describe("subagent-done.ts", () => {
         emit("agent_start");
         await ask();
         let shutdown1 = false;
-        emit("agent_end", { messages: [] }, { shutdown() { shutdown1 = true; } });
+        emit("agent_end", { messages: [] });
+        emit("agent_settled", { aborted: false }, { shutdown() { shutdown1 = true; } });
         assert.equal(shutdown1, false, "parks while waiting");
         // Reply arrives as a fresh turn after the subagent had parked.
         emit("input");
         emit("agent_start");
         let shutdown2 = false;
-        emit("agent_end", { messages: [] }, { shutdown() { shutdown2 = true; } });
+        emit("agent_end", { messages: [] });
+        emit("agent_settled", { aborted: false }, { shutdown() { shutdown2 = true; } });
         assert.equal(shutdown2, true, "after the reply turn, agent_end should exit");
       } finally {
         restore();

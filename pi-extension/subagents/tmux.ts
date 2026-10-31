@@ -12,9 +12,10 @@
  */
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { ensurePrivateDir, writePrivateFile } from "./private-files.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -187,7 +188,7 @@ export function sendLongCommand(
       "pi-subagent-scripts",
       `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`,
     );
-  mkdirSync(dirname(scriptPath), { recursive: true });
+  ensurePrivateDir(dirname(scriptPath));
 
   const scriptParts = ["#!/bin/bash"];
   if (options?.scriptPreamble) {
@@ -195,9 +196,7 @@ export function sendLongCommand(
   }
   scriptParts.push(command);
 
-  writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
-    mode: 0o755,
-  });
+  writePrivateFile(scriptPath, scriptParts.join("\n") + "\n");
   sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
   return scriptPath;
 }
@@ -284,9 +283,12 @@ export async function pollForExit(
     sessionFile?: string;
     sentinelFile?: string;
     onTick?: (elapsed: number) => void;
+    /** Injectable asynchronous pane reader for deterministic tests. */
+    readScreen?: (surface: string, lines: number) => Promise<string>;
   },
 ): Promise<PollResult> {
   const start = Date.now();
+  let consecutiveScreenFailures = 0;
 
   for (;;) {
     if (signal.aborted) {
@@ -316,12 +318,15 @@ export async function pollForExit(
 
     // Slow path: read terminal screen for sentinel (crash detection)
     try {
-      const screen = await readScreenAsync(surface, 5);
+      const screen = await (options.readScreen ?? readScreenAsync)(surface, 5);
+      signal.throwIfAborted();
+      consecutiveScreenFailures = 0;
       const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
       }
     } catch {
+      signal.throwIfAborted();
       // Surface may have been destroyed — check if .exit file appeared in the meantime
       if (options.sessionFile) {
         try {
@@ -333,8 +338,12 @@ export async function pollForExit(
           }
         } catch {}
       }
+      if (++consecutiveScreenFailures >= 3) {
+        return { reason: "error", exitCode: 1, errorMessage: `Unable to read subagent pane ${surface} after three attempts; it may have disappeared.` };
+      }
     }
 
+    signal.throwIfAborted();
     const elapsed = Math.floor((Date.now() - start) / 1000);
     options.onTick?.(elapsed);
 
