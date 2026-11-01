@@ -17,7 +17,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). The layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
+The default `balanced` layout uses a 2D split tree: it redistributes every managed pane after spawning or closing an agent, fills vacated rows/columns, and gives the orchestrator approximately 25% more space than each worker. Other tmux layouts are configurable. Manual zoom, unrelated panes, and manually changed layouts are respected.
 
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
 
@@ -182,14 +182,15 @@ Example for <=4 agents visible at once:
 {
   "status": { "enabled": true },
   "tmux": {
-    "mode": "panes", "layout": "tiled", "labels": "bottom",
+    "mode": "panes", "layout": "balanced", "mainPaneWeight": 1.25, "labels": "bottom",
     "keepCompletedWindows": false, "maxRetainedWindows": 4
   },
   "names": { "fallback": "random" }
 }
 ```
 
-For 5+ agents on a smaller display switch to `"mode": "windows"`.
+For 5+ agents on smaller monitors you can stay with `"mode": "panes"` and
+zoom the selected pane using `Ctrl+b z`, or opt into `"mode": "windows"`.
 To inspect completed windows, set `"keepCompletedWindows": true`; the oldest
 completed window is closed when `maxRetainedWindows` (1-10) is exceeded.
 Aborted spawns, error-sidecars, and nonzero exits are **never** retained.
@@ -199,12 +200,18 @@ do not want the plugin to leave finished shells/windows in your tmux session.
 - `tmux.mode: "panes"` splits the Pi window. Managed panes show the instance
   name on the bottom (`"bottom"`) or top (`"top"`) border; `"off"` leaves
   options unchanged. The parent is labeled `Pi - orchestrator`.
-- `tmux.layout` is one of `tiled`, `even-horizontal`, `even-vertical`,
-  `main-vertical`, `main-horizontal`. Automatic layout is applied **only** when
+- `tmux.layout` is one of `balanced` (recommended), `tiled`, `even-horizontal`,
+  `even-vertical`, `main-vertical`, `main-horizontal`. `balanced` creates a
+  custom full-window 2D layout and gives the Pi orchestrator approximately
+  `tmux.mainPaneWeight` times each worker's area (default `1.25`, range `1..2`).
+  Workers receive nearly equal area and survivors expand after peers finish.
+  The standard `tiled` mode still uses tmux's own equal-pane algorithm.
+  Automatic layout is applied **only** when
   the parent window originally contains a single pane and still contains only
   the Pi pane plus its managed children. If another pane is present, the plugin
   will not re-layout it. Manual changes disable automatic re-layout for that
-  managed window. Existing multi-pane geometry is restored when safe.
+  managed window. A terminal resize is not mistaken for a manual edit.
+  Existing multi-pane geometry is restored when safe.
 - Pane-border and pane-label options are **window/pane-local**. Original local
   values, including unset/inherited values, are restored after the last managed
   child closes. If a person or another extension changes an owned option, the
@@ -217,8 +224,10 @@ do not want the plugin to leave finished shells/windows in your tmux session.
   e.g. `scout-cedar`; `"numbered"` keeps `scout`, `scout-2`, etc. Explicit names
   always take precedence; they are stable registry keys, distinct from short
   sanitized UI labels.
-- `/subagent-tmux-status` shows the current mode, tracked panes/windows and any
-  cosmetic tmux warnings. A failed label operation does not block a subagent.
+- `/subagent-tmux-status` shows the current mode, tracked panes/windows,
+  pending cleanup retries and any cosmetic tmux warnings. Cleanup failures
+  retain ownership and are retried (up to six times) rather than silently
+  orphaning a completed agent pane. A failed label operation does not block a subagent.
 
 Modes are chosen before each new spawn. Changing config does not move existing
 subagents between windows and panes; `/reload` safely preserves their recorded

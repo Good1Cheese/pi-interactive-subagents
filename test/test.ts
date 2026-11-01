@@ -689,7 +689,7 @@ describe("status.ts", () => {
     assert.deepEqual(disabled, {
       enabled: false,
       lineLimit: 4,
-      tmux: { mode: "panes", layout: "tiled", labels: "bottom", keepCompletedWindows: false, maxRetainedWindows: 4 },
+      tmux: { mode: "panes", layout: "balanced", mainPaneWeight: 1.25, labels: "bottom", keepCompletedWindows: false, maxRetainedWindows: 4 },
       names: { fallback: "random" },
     });
   });
@@ -701,7 +701,7 @@ describe("status.ts", () => {
     assert.deepEqual(config, {
       enabled: true,
       lineLimit: 4,
-      tmux: { mode: "panes", layout: "tiled", labels: "bottom", keepCompletedWindows: false, maxRetainedWindows: 4 },
+      tmux: { mode: "panes", layout: "balanced", mainPaneWeight: 1.25, labels: "bottom", keepCompletedWindows: false, maxRetainedWindows: 4 },
       names: { fallback: "random" },
     });
   });
@@ -719,7 +719,7 @@ describe("status.ts", () => {
       assert.deepEqual(config, {
         enabled: true,
         lineLimit: 4,
-        tmux: { mode: "panes", layout: "tiled", labels: "bottom", keepCompletedWindows: false, maxRetainedWindows: 4 },
+        tmux: { mode: "panes", layout: "balanced", mainPaneWeight: 1.25, labels: "bottom", keepCompletedWindows: false, maxRetainedWindows: 4 },
         names: { fallback: "random" },
       });
     });
@@ -742,9 +742,12 @@ describe("status.ts", () => {
       tmux: { mode: "windows", layout: "main-vertical", labels: "off" },
       names: { fallback: "numbered" },
     });
-    assert.deepEqual(windows.tmux, { mode: "windows", layout: "main-vertical", labels: "off", keepCompletedWindows: false, maxRetainedWindows: 4 });
+    assert.deepEqual(windows.tmux, { mode: "windows", layout: "main-vertical", mainPaneWeight: 1.25, labels: "off", keepCompletedWindows: false, maxRetainedWindows: 4 });
     assert.deepEqual(windows.names, { fallback: "numbered" });
     assert.throws(() => parseStatusConfig({ status: { enabled: true }, tmux: { mode: "grid" } }), /tmux.mode must be one of/);
+    assert.equal(parseStatusConfig({ status: { enabled: true }, tmux: { layout: "balanced", mainPaneWeight: 1.4 } }).tmux.mainPaneWeight, 1.4);
+    assert.throws(() => parseStatusConfig({ status: { enabled: true }, tmux: { mainPaneWeight: 0.7 } }), /tmux.mainPaneWeight must be a number/);
+    assert.throws(() => parseStatusConfig({ status: { enabled: true }, tmux: { mainPaneWeight: "1.5" } }), /tmux.mainPaneWeight must be a number/);
     assert.throws(() => parseStatusConfig({ status: { enabled: true }, tmux: { layout: "columns" } }), /tmux.layout must be one of/);
     assert.throws(() => parseStatusConfig({ status: { enabled: true }, tmux: { unexpected: true } }), /tmux has unsupported key/);
     assert.throws(() => parseStatusConfig({ status: { enabled: true }, tmux: { keepCompletedWindows: 1 } }), /tmux.keepCompletedWindows must be a boolean/);
@@ -781,7 +784,7 @@ describe("status.ts", () => {
       const merged = loadSubagentRootConfig(legacy, example, xdg);
       assert.deepEqual(merged.childExtensions, ["/trusted/provider.ts"]);
       assert.deepEqual(loadStatusConfig(legacy, example, xdg).tmux, {
-        mode: "windows", layout: "tiled", labels: "bottom",
+        mode: "windows", layout: "balanced", mainPaneWeight: 1.25, labels: "bottom",
         keepCompletedWindows: false, maxRetainedWindows: 2,
       });
       assert.deepEqual(loadStatusConfig(legacy, example, xdg).names, { fallback: "numbered" });

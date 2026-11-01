@@ -4,6 +4,7 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createWeightedLayout } from "../pi-extension/subagents/weighted-layout.ts";
 import {
   configureTmuxSurfaces, createSurface, closeSurface, PANE_BORDER_FORMAT,
   tmuxDisplayName, tmuxSurfaceStatus, isCleanSurfaceCompletion, __resetTmuxRuntimeForTest,
@@ -11,11 +12,11 @@ import {
 import type { TmuxSurfaceConfig } from "../pi-extension/subagents/tmux.ts";
 
 const baseConfig: TmuxSurfaceConfig = {
-  mode: "panes", layout: "tiled", labels: "bottom",
+  mode: "panes", layout: "tiled", mainPaneWeight: 1.25, labels: "bottom",
   keepCompletedWindows: false, maxRetainedWindows: 4,
 };
 const initialState = () => ({
-  nextPane: 200, nextWindow: 10, seq: 0, failSetOption: false,
+  nextPane: 200, nextWindow: 10, seq: 0, failSetOption: false, failKillPaneOnce: 0,
   windows: {
     "@7": { index: 1, title: "pi", options: {} as Record<string, string>, panes: ["%100"], layout: "original-pi" },
     "@8": { index: 2, title: "zsh", options: {} as Record<string, string>, panes: ["%101"], layout: "original-zsh" },
@@ -70,6 +71,85 @@ const has = (trace: string[][], command: string, rest: string[] = []) =>
 const tick = () => new Promise((resolve) => setTimeout(resolve, 210));
 
 describe("tmux layout and stable instance labels", () => {
+  it("reflows surviving children after bottom panels close and keeps orchestrator larger", async () => {
+    await withFakeTmux(async (ctx) => {
+      configureTmuxSurfaces({ ...baseConfig, layout: "balanced", mainPaneWeight: 1.25 });
+      const children = Array.from({ length: 4 }, (_, i) => createSurface(`worker-${i}`));
+      await tick();
+      const custom = () => ctx.trace().filter(args => args[0] === "select-layout" && args.at(-1)?.includes(","));
+      assert.equal(custom().at(-1)?.at(-1), createWeightedLayout(170, 45, 5, 1.25)!.layout);
+      // The same scenario as the screenshot: the lower panes have disappeared,
+      // and the survivors must expand into the empty space.
+      closeSurface(children[3]);
+      closeSurface(children[2]);
+      await tick();
+      assert.equal(ctx.read().windows["@7"].panes.length, 3);
+      assert.equal(custom().at(-1)?.at(-1), createWeightedLayout(170, 45, 3, 1.25)!.layout);
+      const count = custom().length;
+      const added = createSurface("fresh-scout");
+      await tick();
+      assert.equal(custom().at(-1)?.at(-1), createWeightedLayout(170, 45, 4, 1.25)!.layout);
+      assert.ok(custom().length > count);
+      closeSurface(children[0]);
+      closeSurface(children[1]);
+      closeSurface(added);
+      assert.equal(ctx.read().windows["@7"].panes.length, 1);
+    });
+  });
+
+  it("keeps failed kill-pane tracked and retries cleanup without leaving orphan panes", async () => {
+    await withFakeTmux(async (ctx) => {
+      configureTmuxSurfaces({ ...baseConfig, layout: "balanced" });
+      const child = createSurface("worker");
+      ctx.mutate(s => { s.failKillPaneOnce = 1; });
+      closeSurface(child);
+      assert.equal(ctx.read().windows["@7"].panes.length, 2);
+      assert.match(tmuxSurfaceStatus(), /pendingCleanups=1/);
+      await new Promise(resolve => setTimeout(resolve, 350));
+      assert.equal(ctx.read().windows["@7"].panes.length, 1);
+      assert.match(tmuxSurfaceStatus(), /pendingCleanups=0/);
+      assert.match(tmuxSurfaceStatus(), /runningSurfaces=0/);
+    });
+  });
+
+  it("falls back to built-in tiled when tmux rejects weighted custom layouts", async () => {
+    await withFakeTmux(async ctx => {
+      configureTmuxSurfaces({ ...baseConfig, layout: "balanced" });
+      const child = createSurface("worker");
+      await tick();
+      assert.ok(has(ctx.trace(), "select-layout", ["tiled"]));
+      assert.equal(ctx.read().windows["@7"].panes.length, 2);
+      closeSurface(child);
+    }, state => { (state as any).failCustomLayout = true; });
+  });
+
+  it("resizes automatic layout with the terminal instead of treating resize as manual", async () => {
+    await withFakeTmux(async ctx => {
+      configureTmuxSurfaces({ ...baseConfig, layout: "balanced" });
+      const first = createSurface("first");
+      await tick();
+      ctx.mutate(s => { (s as any).width = 200; s.windows["@7"].layout = "tmux-terminal-resized"; });
+      const second = createSurface("second");
+      await tick();
+      const custom = ctx.trace().filter(args => args[0] === "select-layout" && args.at(-1)?.includes(","));
+      assert.equal(custom.at(-1)?.at(-1), createWeightedLayout(200, 45, 3, 1.25)!.layout);
+      closeSurface(first);
+      closeSurface(second);
+    });
+  });
+
+  it("finalizes cleanup when the pane was already removed by tmux", async () => {
+    await withFakeTmux(async (ctx) => {
+      configureTmuxSurfaces(baseConfig);
+      const child = createSurface("gone");
+      ctx.mutate(s => { s.windows["@7"].panes = ["%100"]; });
+      closeSurface(child);
+      assert.match(tmuxSurfaceStatus(), /runningSurfaces=0/);
+      assert.match(tmuxSurfaceStatus(), /pendingCleanups=0/);
+      assert.equal(ctx.read().windows["@7"].options["pane-border-status"], undefined);
+    });
+  });
+
   it("labels all managed panes and restores inherited options on last exit", async () => {
     await withFakeTmux(async (ctx) => {
       configureTmuxSurfaces(baseConfig);

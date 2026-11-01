@@ -22,7 +22,8 @@ export type NameFallback = "random" | "numbered";
 
 export const DEFAULT_TMUX_CONFIG: TmuxSurfaceConfig = {
   mode: "panes",
-  layout: "tiled",
+  layout: "balanced",
+  mainPaneWeight: 1.25,
   labels: "bottom",
   keepCompletedWindows: false,
   maxRetainedWindows: 4,
@@ -121,6 +122,14 @@ function boundedInt(value: unknown, fallback: number, source: string, fieldName:
   return value as number;
 }
 
+function mainWeight(value: unknown, source: string): number {
+  if (value === undefined) return DEFAULT_TMUX_CONFIG.mainPaneWeight;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 1 || value > 2) {
+    invalidStatusConfig(source, "tmux.mainPaneWeight must be a number between 1 and 2");
+  }
+  return value;
+}
+
 function requireBoolean(value: unknown, source: string, fieldName: string): boolean {
   if (typeof value !== "boolean") {
     invalidStatusConfig(source, `${fieldName} must be a boolean`);
@@ -165,7 +174,7 @@ function activityLabel(snapshot: Pick<StatusSnapshot, "activityLabel" | "activeS
 }
 
 const TMUX_MODES = ["panes", "windows"] as const;
-const TMUX_LAYOUTS = ["tiled", "even-horizontal", "even-vertical", "main-vertical", "main-horizontal"] as const;
+const TMUX_LAYOUTS = ["balanced", "tiled", "even-horizontal", "even-vertical", "main-vertical", "main-horizontal"] as const;
 const LABEL_POSITIONS = ["bottom", "top", "off"] as const;
 const NAME_FALLBACKS = ["random", "numbered"] as const;
 
@@ -185,7 +194,7 @@ export function parseStatusConfig(rawConfig: unknown, source = "config.json"): S
   const enabled = requireBoolean(status.enabled, source, "status.enabled");
 
   const tmux = config.tmux === undefined ? {} : requireObject(config.tmux, source, "tmux");
-  rejectUnsupportedKeys(tmux, ["mode", "layout", "labels", "keepCompletedWindows", "maxRetainedWindows"], source, "tmux");
+  rejectUnsupportedKeys(tmux, ["mode", "layout", "mainPaneWeight", "labels", "keepCompletedWindows", "maxRetainedWindows"], source, "tmux");
   const names = config.names === undefined ? {} : requireObject(config.names, source, "names");
   rejectUnsupportedKeys(names, ["fallback"], source, "names");
 
@@ -195,6 +204,7 @@ export function parseStatusConfig(rawConfig: unknown, source = "config.json"): S
     tmux: {
       mode: configChoice(tmux.mode, TMUX_MODES, DEFAULT_TMUX_CONFIG.mode, source, "tmux.mode"),
       layout: configChoice(tmux.layout, TMUX_LAYOUTS, DEFAULT_TMUX_CONFIG.layout, source, "tmux.layout"),
+      mainPaneWeight: mainWeight(tmux.mainPaneWeight, source),
       labels: configChoice(tmux.labels, LABEL_POSITIONS, DEFAULT_TMUX_CONFIG.labels, source, "tmux.labels"),
       keepCompletedWindows: tmux.keepCompletedWindows === undefined ? false : requireBoolean(tmux.keepCompletedWindows, source, "tmux.keepCompletedWindows"),
       maxRetainedWindows: boundedInt(tmux.maxRetainedWindows, 4, source, "tmux.maxRetainedWindows"),

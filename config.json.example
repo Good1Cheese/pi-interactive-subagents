@@ -2,7 +2,8 @@
   "status": { "enabled": true },
   "tmux": {
     "mode": "panes",
-    "layout": "tiled",
+    "layout": "balanced",
+    "mainPaneWeight": 1.25,
     "labels": "bottom",
     "keepCompletedWindows": false,
     "maxRetainedWindows": 4

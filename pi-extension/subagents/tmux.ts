@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
 import { ensurePrivateDir, writePrivateFile } from "./private-files.ts";
+import { createWeightedLayout } from "./weighted-layout.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -73,14 +74,16 @@ export function shellEscape(s: string): string {
 
 export interface TmuxSurfaceConfig {
   mode: "panes" | "windows";
-  layout: "tiled" | "even-horizontal" | "even-vertical" | "main-vertical" | "main-horizontal";
+  layout: "balanced" | "tiled" | "even-horizontal" | "even-vertical" | "main-vertical" | "main-horizontal";
+  /** Area of orchestrator pane relative to each child. Used by balanced layout. */
+  mainPaneWeight: number;
   labels: "bottom" | "top" | "off";
   keepCompletedWindows: boolean;
   maxRetainedWindows: number;
 }
 
 const DEFAULT_SURFACE_CONFIG: TmuxSurfaceConfig = {
-  mode: "panes", layout: "tiled", labels: "bottom",
+  mode: "panes", layout: "balanced", mainPaneWeight: 1.25, labels: "bottom",
   keepCompletedWindows: false, maxRetainedWindows: 4,
 };
 let surfaceConfig: TmuxSurfaceConfig = { ...DEFAULT_SURFACE_CONFIG };
@@ -106,6 +109,7 @@ interface ManagedWindow {
   parentLabel: OwnedOption;
   automaticLayout: boolean;
   lastKnownLayout?: string;
+  lastKnownSize?: string;
   timer?: ReturnType<typeof setTimeout>;
 }
 interface ManagedSurface { mode: "panes" | "windows"; name: string; windowId?: string }
@@ -114,11 +118,14 @@ interface TmuxRuntime {
   windows: Map<string, ManagedWindow>;
   retained: string[];
   warnings: Set<string>;
+  pendingCleanups: Map<string, { attempts: number; timer?: ReturnType<typeof setTimeout> }>;
 }
 const runtime: TmuxRuntime =
   ((globalThis as any)[SURFACES_KEY] ??= {
-    surfaces: new Map(), windows: new Map(), retained: [], warnings: new Set(),
+    surfaces: new Map(), windows: new Map(), retained: [], warnings: new Set(), pendingCleanups: new Map(),
   });
+// Survive /reload with a runtime created by an earlier extension version.
+runtime.pendingCleanups ??= new Map();
 
 function tmux(...args: string[]): string {
   return execFileSync("tmux", args, { encoding: "utf8" }).replace(/\r?\n$/, "");
@@ -193,6 +200,19 @@ function listWindowPanes(windowId: string): Set<string> {
 function windowLayout(windowId: string): string {
   return tmux("display-message", "-p", "-t", windowId, "#{window_layout}");
 }
+function windowSize(windowId: string): { width: number; height: number; key: string } | undefined {
+  const raw = tmux("display-message", "-p", "-t", windowId, "#{window_width}x#{window_height}");
+  const match = /^(\d+)x(\d+)$/.exec(raw);
+  if (!match) return undefined;
+  return { width: Number(match[1]), height: Number(match[2]), key: raw };
+}
+/** A missing pane after another actor's kill is successful cleanup, not a leak. */
+function paneExistsAnywhere(pane: string): boolean | undefined {
+  try {
+    return tmux("list-panes", "-a", "-F", "#{pane_id}").split("\n").includes(pane);
+  } catch { return undefined; }
+}
+
 function windowIdOf(pane: string): string {
   const id = tmux("display-message", "-p", "-t", pane, "#{window_id}");
   if (!/^@\d+$/.test(id)) throw new Error(`Unexpected tmux window id: ${id}`);
@@ -238,11 +258,24 @@ function restoreLabels(state: ManagedWindow): void {
   catch (err) { warnCosmetic("restore orchestrator pane label", err); }
 }
 
-/** When user changes layout, do not apply an automatic layout again. */
+/** Stop managing layout only for a genuine user/manual change, not a resize. */
 function verifyLayoutOwner(state: ManagedWindow): void {
   if (!state.automaticLayout || state.lastKnownLayout === undefined) return;
   try {
-    if (windowLayout(state.id) !== state.lastKnownLayout) state.automaticLayout = false;
+    // Zoom is a transient view state, not a manual pane rearrangement.
+    // It must neither be cancelled nor permanently relinquish ownership.
+    if (tmux("display-message", "-p", "-t", state.id, "#{window_zoomed_flag}") === "1") return;
+    const layout = windowLayout(state.id);
+    if (layout === state.lastKnownLayout) return;
+    // Tmux adjusts geometry when the attached terminal is resized. Rebalance
+    // on the next topology change instead of misclassifying this as manual.
+    const size = windowSize(state.id);
+    if (size && state.lastKnownSize && size.key !== state.lastKnownSize) {
+      state.lastKnownLayout = layout;
+      state.lastKnownSize = size.key;
+      return;
+    }
+    state.automaticLayout = false;
   } catch (err) { state.automaticLayout = false; warnCosmetic("inspect window layout", err); }
 }
 
@@ -252,28 +285,66 @@ function canRebalance(state: ManagedWindow): boolean {
   try {
     if (tmux("display-message", "-p", "-t", state.id, "#{window_zoomed_flag}") === "1") return false;
   } catch (err) { warnCosmetic("inspect tmux zoom", err); return false; }
-  // Do not re-layout unrelated user or nested-agent panes.
+  // Do not re-layout unrelated user or nested-agent panes, and don't infer
+  // layout ownership from the number of panes alone.
   try {
     const allowed = new Set([...state.baselinePanes, ...state.children]);
-    return [...listWindowPanes(state.id)].every((id) => allowed.has(id));
+    const actual = listWindowPanes(state.id);
+    return actual.size === allowed.size && [...actual].every((id) => allowed.has(id));
   } catch (err) { warnCosmetic("inspect panes before layout", err); return false; }
+}
+
+/** Realign every surviving pane after joins/leaves, with no empty bottom rows. */
+function applyRebalance(state: ManagedWindow): void {
+  if (!canRebalance(state)) return;
+  verifyLayoutOwner(state);
+  if (!state.automaticLayout) return;
+  try {
+    const ids = [...listWindowPanes(state.id)];
+    if (surfaceConfig.layout === "balanced") {
+      // The tmux v1 custom layout parser assigns leaves in pane-list order.
+      // If the parent is not first, never assign the larger cell to a worker.
+      if (ids[0] !== state.parent) {
+        warnCosmetic("balanced layout", new Error("parent pane is not first; using tiled instead"));
+        tmux("select-layout", "-t", state.id, "tiled");
+      } else {
+        const size = windowSize(state.id);
+        const weighted = size && createWeightedLayout(
+          size.width, size.height, ids.length, surfaceConfig.mainPaneWeight,
+        );
+        if (weighted) tmux("select-layout", "-t", state.id, weighted.layout);
+        else tmux("select-layout", "-t", state.id, "tiled");
+      }
+    } else {
+      tmux("select-layout", "-t", state.id, surfaceConfig.layout);
+    }
+    state.lastKnownLayout = windowLayout(state.id);
+    state.lastKnownSize = windowSize(state.id)?.key;
+  } catch (err) {
+    warnCosmetic("could not rebalance panes", err);
+    // Older tmux versions or a very small terminal may reject a custom
+    // layout. Recover the full window with tmux's built-in tiled geometry.
+    if (surfaceConfig.layout === "balanced") {
+      try {
+        tmux("select-layout", "-t", state.id, "tiled");
+        state.lastKnownLayout = windowLayout(state.id);
+        state.lastKnownSize = windowSize(state.id)?.key;
+      } catch (fallbackError) { warnCosmetic("balanced layout tiled fallback failed", fallbackError); }
+    }
+  }
 }
 
 function scheduleRebalance(state: ManagedWindow): void {
   if (state.timer) clearTimeout(state.timer);
   state.timer = undefined;
   if (!canRebalance(state)) return;
-  try { state.lastKnownLayout = windowLayout(state.id); }
-  catch (err) { warnCosmetic("inspect layout before rebalancing", err); return; }
+  try {
+    state.lastKnownLayout = windowLayout(state.id);
+    state.lastKnownSize = windowSize(state.id)?.key;
+  } catch (err) { warnCosmetic("inspect layout before rebalancing", err); return; }
   state.timer = setTimeout(() => {
     state.timer = undefined;
-    if (!canRebalance(state)) return;
-    verifyLayoutOwner(state);
-    if (!state.automaticLayout) return;
-    try {
-      tmux("select-layout", "-t", state.id, surfaceConfig.layout);
-      state.lastKnownLayout = windowLayout(state.id);
-    } catch (err) { warnCosmetic("could not rebalance panes", err); }
+    applyRebalance(state);
   }, 120);
   state.timer.unref?.();
 }
@@ -281,11 +352,11 @@ function scheduleRebalance(state: ManagedWindow): void {
 /** Config changes on /reload do not reclassify already spawned panes/windows. */
 export function configureTmuxSurfaces(config: TmuxSurfaceConfig): void {
   const previous = surfaceConfig;
-  surfaceConfig = { ...config };
+  surfaceConfig = { ...DEFAULT_SURFACE_CONFIG, ...config };
   for (const state of runtime.windows.values()) {
     if (state.timer) { clearTimeout(state.timer); state.timer = undefined; }
     if (config.labels === "off" && previous.labels !== "off") restoreLabels(state);
-    if (config.mode !== previous.mode || config.layout !== previous.layout) {
+    if (config.mode !== previous.mode || config.layout !== previous.layout || config.mainPaneWeight !== previous.mainPaneWeight) {
       // Existing panes stay in their original mode and retain their layout.
       state.automaticLayout = false;
     }
@@ -295,6 +366,8 @@ export function configureTmuxSurfaces(config: TmuxSurfaceConfig): void {
 /** Test-only: reset process-shared state after disposable fake-tmux sessions. */
 export function __resetTmuxRuntimeForTest(): void {
   for (const state of runtime.windows.values()) if (state.timer) clearTimeout(state.timer);
+  for (const cleanup of runtime.pendingCleanups.values()) if (cleanup.timer) clearTimeout(cleanup.timer);
+  runtime.pendingCleanups.clear();
   runtime.surfaces.clear();
   runtime.windows.clear();
   runtime.retained.length = 0;
@@ -303,9 +376,9 @@ export function __resetTmuxRuntimeForTest(): void {
 }
 
 export function tmuxSurfaceStatus(): string {
-  return `mode=${surfaceConfig.mode}, layout=${surfaceConfig.layout}, labels=${surfaceConfig.labels}, ` +
+  return `mode=${surfaceConfig.mode}, layout=${surfaceConfig.layout}, mainPaneWeight=${surfaceConfig.mainPaneWeight}, labels=${surfaceConfig.labels}, ` +
     `runningSurfaces=${runtime.surfaces.size}, paneWindows=${runtime.windows.size}, ` +
-    `retainedWindows=${runtime.retained.length}, warnings=${runtime.warnings.size}`;
+    `retainedWindows=${runtime.retained.length}, pendingCleanups=${runtime.pendingCleanups.size}, warnings=${runtime.warnings.size}`;
 }
 
 /** A new window in the same session without -a/-b (which renumber existing tabs). */
@@ -383,7 +456,7 @@ export function createSurfaceSplit(
   if (state) {
     runtime.windows.set(state.id, state);
     state.children.add(pane);
-    try { state.lastKnownLayout = windowLayout(state.id); }
+    try { state.lastKnownLayout = windowLayout(state.id); state.lastKnownSize = windowSize(state.id)?.key; }
     catch (err) { state.automaticLayout = false; warnCosmetic("inspect split layout", err); }
     runtime.surfaces.set(pane, { mode: "panes", name, windowId: state.id });
     applyLabels(state, pane, name);
@@ -468,9 +541,25 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
   return stdout;
 }
 
-/**
- * Close a pane.
- */
+/** Retry transient cleanup failures without orphaning completed panes. */
+function queueCleanupRetry(surface: string, error: unknown): void {
+  const pending = runtime.pendingCleanups.get(surface) ?? { attempts: 0 };
+  if (pending.timer || pending.attempts >= 6) {
+    if (pending.attempts >= 6) warnCosmetic("pane cleanup exhausted retries", error);
+    return;
+  }
+  pending.attempts++;
+  runtime.pendingCleanups.set(surface, pending);
+  warnCosmetic(`retry pane cleanup ${surface} (${pending.attempts}/6)`, error);
+  pending.timer = setTimeout(() => {
+    pending.timer = undefined;
+    if (!runtime.surfaces.has(surface)) { runtime.pendingCleanups.delete(surface); return; }
+    try { closeSurface(surface); }
+    catch (err) { queueCleanupRetry(surface, err); }
+  }, Math.min(1000, 150 * pending.attempts));
+  pending.timer.unref?.();
+}
+
 /**
  * Completed windows can be retained for inspection. Aborted or failed launches
  * always close. Retention has a hard cap; the oldest retained pane is closed.
@@ -496,21 +585,31 @@ export function closeSurface(surface: string, options: { completed?: boolean } =
   }
 
   // Observe manual layout edits while the child is still present. Otherwise
-  // tmux's own resize caused by kill-pane looks like a user modification.
+  // tmux's own geometry change on kill-pane looks like a manual edit.
   const state = managed?.mode === "panes" && managed.windowId
     ? runtime.windows.get(managed.windowId) : undefined;
   if (state) verifyLayoutOwner(state);
-  let killError: unknown;
-  try { tmux("kill-pane", "-t", surface); }
-  catch (err) { killError = err; }
-  try {
+
+  let killed = false;
+  try { tmux("kill-pane", "-t", surface); killed = true; }
+  catch (err) {
+    // A different actor may already have removed the pane. An unexpected
+    // failure while it still exists must NOT delete it from our registry.
+    const present = paneExistsAnywhere(surface);
+    if (present !== false) {
+      queueCleanupRetry(surface, err);
+      return;
+    }
+  }
+  if (killed || managed) {
+    const pending = runtime.pendingCleanups.get(surface);
+    if (pending?.timer) clearTimeout(pending.timer);
+    runtime.pendingCleanups.delete(surface);
     runtime.surfaces.delete(surface);
     if (managed?.mode === "panes" && managed.windowId) {
       const state = runtime.windows.get(managed.windowId);
       if (state) {
         state.children.delete(surface);
-        // Only restore a pre-existing multi-pane layout when its original
-        // panes still exist and nobody resized or replaced the layout.
         if (state.children.size === 0) {
           if (state.timer) clearTimeout(state.timer);
           if (state.automaticLayout && state.baselinePanes.size > 1) {
@@ -525,14 +624,17 @@ export function closeSurface(surface: string, options: { completed?: boolean } =
           restoreLabels(state);
           runtime.windows.delete(state.id);
         } else {
-          try { state.lastKnownLayout = windowLayout(state.id); }
-          catch (err) { state.automaticLayout = false; warnCosmetic("inspect pane removal layout", err); }
+          // Do not call verifyLayoutOwner() after kill-pane: tmux *always*
+          // changes window_layout when a pane leaves. This used to disable
+          // auto-layout and leave stranded panels in the top half of the screen.
+          try {
+            state.lastKnownLayout = windowLayout(state.id);
+            state.lastKnownSize = windowSize(state.id)?.key;
+          } catch (err) { warnCosmetic("inspect pane removal layout", err); }
           scheduleRebalance(state);
         }
       }
     }
-  } finally {
-    if (killError) throw killError;
   }
 }
 

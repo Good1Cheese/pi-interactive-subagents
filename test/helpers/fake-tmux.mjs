@@ -23,14 +23,18 @@ try {
   if (kind === "display-message") {
     const fmt = args.at(-1);
     const id = resolveWindow(target);
-    output = fmt === "#{window_id}" ? id
+    output = fmt === "#{pane_id}" ? (findPane(target)?.[1].panes.includes(target) ? target : "")
+      : fmt === "#{window_width}x#{window_height}" ? `${state.width ?? 170}x${state.height ?? 45}`
+      : fmt === "#{window_id}" ? id
       : fmt === "#{session_id}" ? "$3"
       : fmt === "#{window_layout}" ? windows[id].layout
       : fmt === "#{window_index}" ? String(windows[id].index)
       : fmt === "#{window_zoomed_flag}" ? (windows[id].zoomed ? "1" : "0")
       : "";
   } else if (kind === "list-panes") {
-    output = windows[resolveWindow(target)].panes.join("\n");
+    output = args.includes("-a")
+      ? Object.values(windows).flatMap(w => w.panes).join("\n")
+      : windows[resolveWindow(target)].panes.join("\n");
   } else if (kind === "show-options") {
     const pane = args.includes("-p");
     const record = pane ? state.paneOptions[target] ?? {} : windows[resolveWindow(target)].options;
@@ -62,9 +66,17 @@ try {
     windows[id] = { index: idx, title: value("-n"), options: {}, panes: [pane], layout: "one" };
     output = pane;
   } else if (kind === "select-layout") {
+    if (state.failCustomLayout && /^[a-f\d]{4},/.test(args.at(-1) ?? "")) {
+      throw new Error("Custom layout unsupported by tmux");
+    }
     const id = resolveWindow(target);
     touch(id, args.at(-1));
   } else if (kind === "kill-pane") {
+    if (state.failKillPaneOnce > 0) {
+      state.failKillPaneOnce--;
+      writeFileSync(filename, JSON.stringify(state));
+      throw new Error("Simulated transient kill-pane failure");
+    }
     const match = findPane(target);
     if (!match) throw new Error("no such pane");
     const [id, w] = match;

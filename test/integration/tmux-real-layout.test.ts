@@ -21,7 +21,7 @@ function findTmux(): string | undefined {
 }
 const binary = findTmux();
 const base: TmuxSurfaceConfig = {
-  mode: "panes", layout: "tiled", labels: "bottom",
+  mode: "panes", layout: "tiled", mainPaneWeight: 1.25, labels: "bottom",
   keepCompletedWindows: false, maxRetainedWindows: 4,
 };
 
@@ -97,6 +97,54 @@ describe("real tmux layout / lifecycle (isolated socket)", { skip: binary ? fals
     assert.equal(show("-w", pane, "pane-border-status"), "top");
     assert.equal(show("-w", pane, "pane-border-format"), "CUSTOM #{pane_index}");
     assert.equal(show("-p", pane, "@pi_subagent_name"), "original-parent");
+  });
+
+  it("reflows when lower agents finish, with orchestrator slightly larger", async () => {
+    configureTmuxSurfaces({ ...base, layout: "balanced", mainPaneWeight: 1.25 });
+    const created: string[] = [];
+    const delay = () => new Promise(resolve => setTimeout(resolve, 300));
+    const cells = () => real("list-panes", "-t", pane, "-F", "#{pane_id} #{pane_left} #{pane_top} #{pane_width} #{pane_height}")
+      .split("\n").map(line => {
+        const [id, x, y, w, h] = line.split(" ");
+        return { id, x: Number(x), y: Number(y), width: Number(w), height: Number(h) };
+      });
+    const assertBalanced = () => {
+      const layout = cells();
+      assert.equal(layout[0].id, pane, "orchestrator pane must remain first");
+      const parentArea = layout[0].width * layout[0].height;
+      const workerAreas = layout.slice(1).map(c => c.width * c.height);
+      const mean = workerAreas.reduce((a, b) => a + b, 0) / workerAreas.length;
+      assert.ok(parentArea > mean, `orchestrator not larger: ${JSON.stringify(layout)}`);
+      assert.ok(Math.max(...workerAreas) / Math.min(...workerAreas) < 1.35,
+        `workers not equally sized: ${JSON.stringify(layout)}`);
+      const maxY = Math.max(...layout.map(c => c.y + c.height));
+      const maxX = Math.max(...layout.map(c => c.x + c.width));
+      assert.equal(maxY, Number(real("display-message", "-p", "-t", pane, "#{window_height}")),
+        "no empty band at bottom");
+      assert.equal(maxX, Number(real("display-message", "-p", "-t", pane, "#{window_width}")),
+        "no empty band at right");
+    };
+    try {
+      for (let i = 0; i < 4; ++i) created.push(createSurface(`worker-${i}`));
+      await delay();
+      assertBalanced();
+      closeSurface(created[3]);
+      closeSurface(created[2]);
+      await delay();
+      assertBalanced();
+      const replacement = createSurface("replacement");
+      created.push(replacement);
+      await delay();
+      assertBalanced();
+    } finally {
+      for (const child of created) {
+        try { closeSurface(child); } catch { /* already gone */ }
+      }
+    }
+    await delay();
+    assert.equal(paneCount(), 1);
+    assert.equal(real("display-message", "-p", "-t", pane, "#{pane_width}"),
+      real("display-message", "-p", "-t", pane, "#{window_width}"));
   });
 
   it("does not overwrite manual border changes made after launch", () => {
