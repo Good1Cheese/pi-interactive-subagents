@@ -99,10 +99,10 @@ describe("real tmux layout / lifecycle (isolated socket)", { skip: binary ? fals
     assert.equal(show("-p", pane, "@pi_subagent_name"), "original-parent");
   });
 
-  it("reflows when lower agents finish, with orchestrator slightly larger", async () => {
+  it("reflows immediately during bursts and after lower agents finish, with orchestrator largest", () => {
+    real("resize-window", "-t", pane, "-x", "170", "-y", "45");
     configureTmuxSurfaces({ ...base, layout: "balanced", mainPaneWeight: 1.25 });
     const created: string[] = [];
-    const delay = () => new Promise(resolve => setTimeout(resolve, 300));
     const cells = () => real("list-panes", "-t", pane, "-F", "#{pane_id} #{pane_left} #{pane_top} #{pane_width} #{pane_height}")
       .split("\n").map(line => {
         const [id, x, y, w, h] = line.split(" ");
@@ -113,35 +113,34 @@ describe("real tmux layout / lifecycle (isolated socket)", { skip: binary ? fals
       assert.equal(layout[0].id, pane, "orchestrator pane must remain first");
       const parentArea = layout[0].width * layout[0].height;
       const workerAreas = layout.slice(1).map(c => c.width * c.height);
-      const mean = workerAreas.reduce((a, b) => a + b, 0) / workerAreas.length;
-      assert.ok(parentArea > mean, `orchestrator not larger: ${JSON.stringify(layout)}`);
+      assert.ok(parentArea > Math.max(...workerAreas), `orchestrator not largest: ${JSON.stringify(layout)}`);
       assert.ok(Math.max(...workerAreas) / Math.min(...workerAreas) < 1.35,
         `workers not equally sized: ${JSON.stringify(layout)}`);
       const maxY = Math.max(...layout.map(c => c.y + c.height));
       const maxX = Math.max(...layout.map(c => c.x + c.width));
-      assert.equal(maxY, Number(real("display-message", "-p", "-t", pane, "#{window_height}")),
-        "no empty band at bottom");
+      const bottomBorder = show("-w", pane, "pane-border-status") === "bottom" ? 1 : 0;
+      assert.equal(maxY + bottomBorder, Number(real("display-message", "-p", "-t", pane, "#{window_height}")),
+        "only the pane label row may remain at bottom");
       assert.equal(maxX, Number(real("display-message", "-p", "-t", pane, "#{window_width}")),
         "no empty band at right");
     };
     try {
-      for (let i = 0; i < 4; ++i) created.push(createSurface(`worker-${i}`));
-      await delay();
-      assertBalanced();
+      for (let i = 0; i < 8; ++i) {
+        created.push(createSurface(`worker-${i}`));
+        assertBalanced();
+      }
       closeSurface(created[3]);
+      assertBalanced();
       closeSurface(created[2]);
-      await delay();
       assertBalanced();
       const replacement = createSurface("replacement");
       created.push(replacement);
-      await delay();
       assertBalanced();
     } finally {
       for (const child of created) {
         try { closeSurface(child); } catch { /* already gone */ }
       }
     }
-    await delay();
     assert.equal(paneCount(), 1);
     assert.equal(real("display-message", "-p", "-t", pane, "#{pane_width}"),
       real("display-message", "-p", "-t", pane, "#{window_width}"));
@@ -158,7 +157,7 @@ describe("real tmux layout / lifecycle (isolated socket)", { skip: binary ? fals
     real("set-option", "-p", "-u", "-t", pane, "@pi_subagent_name");
   });
 
-  it("does not replace a zoomed pane's layout during a pending rebalance", async () => {
+  it("does not replace a manually zoomed pane's layout while agents run", async () => {
     configureTmuxSurfaces(base);
     const child = createSurface("zoom-scout");
     try {

@@ -60,8 +60,7 @@ function verifyNoUnusedSpace(width: number, height: number, count: number, weigh
   if (count >= 2) {
     const areas = rects.map(r => r.width * r.height);
     const others = areas.slice(1);
-    const mean = others.reduce((a, b) => a + b, 0) / others.length;
-    assert.ok(areas[0] > mean, `orchestrator should exceed worker average: ${areas}`);
+    assert.ok(areas[0] > Math.max(...others), `orchestrator should exceed every worker: ${areas}`);
     assert.ok(Math.max(...others) / Math.min(...others) < 1.3, `workers not balanced: ${areas}`);
   }
 }

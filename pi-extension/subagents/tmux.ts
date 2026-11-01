@@ -110,7 +110,6 @@ interface ManagedWindow {
   automaticLayout: boolean;
   lastKnownLayout?: string;
   lastKnownSize?: string;
-  timer?: ReturnType<typeof setTimeout>;
 }
 interface ManagedSurface { mode: "panes" | "windows"; name: string; windowId?: string }
 interface TmuxRuntime {
@@ -334,27 +333,11 @@ function applyRebalance(state: ManagedWindow): void {
   }
 }
 
-function scheduleRebalance(state: ManagedWindow): void {
-  if (state.timer) clearTimeout(state.timer);
-  state.timer = undefined;
-  if (!canRebalance(state)) return;
-  try {
-    state.lastKnownLayout = windowLayout(state.id);
-    state.lastKnownSize = windowSize(state.id)?.key;
-  } catch (err) { warnCosmetic("inspect layout before rebalancing", err); return; }
-  state.timer = setTimeout(() => {
-    state.timer = undefined;
-    applyRebalance(state);
-  }, 120);
-  state.timer.unref?.();
-}
-
 /** Config changes on /reload do not reclassify already spawned panes/windows. */
 export function configureTmuxSurfaces(config: TmuxSurfaceConfig): void {
   const previous = surfaceConfig;
   surfaceConfig = { ...DEFAULT_SURFACE_CONFIG, ...config };
   for (const state of runtime.windows.values()) {
-    if (state.timer) { clearTimeout(state.timer); state.timer = undefined; }
     if (config.labels === "off" && previous.labels !== "off") restoreLabels(state);
     if (config.mode !== previous.mode || config.layout !== previous.layout || config.mainPaneWeight !== previous.mainPaneWeight) {
       // Existing panes stay in their original mode and retain their layout.
@@ -365,7 +348,6 @@ export function configureTmuxSurfaces(config: TmuxSurfaceConfig): void {
 
 /** Test-only: reset process-shared state after disposable fake-tmux sessions. */
 export function __resetTmuxRuntimeForTest(): void {
-  for (const state of runtime.windows.values()) if (state.timer) clearTimeout(state.timer);
   for (const cleanup of runtime.pendingCleanups.values()) if (cleanup.timer) clearTimeout(cleanup.timer);
   runtime.pendingCleanups.clear();
   runtime.surfaces.clear();
@@ -460,7 +442,8 @@ export function createSurfaceSplit(
     catch (err) { state.automaticLayout = false; warnCosmetic("inspect split layout", err); }
     runtime.surfaces.set(pane, { mode: "panes", name, windowId: state.id });
     applyLabels(state, pane, name);
-    scheduleRebalance(state);
+    // Reflow before another synchronous spawn can halve the parent again.
+    applyRebalance(state);
   } else {
     runtime.surfaces.set(pane, { mode: "panes", name });
   }
@@ -611,7 +594,6 @@ export function closeSurface(surface: string, options: { completed?: boolean } =
       if (state) {
         state.children.delete(surface);
         if (state.children.size === 0) {
-          if (state.timer) clearTimeout(state.timer);
           if (state.automaticLayout && state.baselinePanes.size > 1) {
             try {
               const remaining = listWindowPanes(state.id);
@@ -631,7 +613,7 @@ export function closeSurface(surface: string, options: { completed?: boolean } =
             state.lastKnownLayout = windowLayout(state.id);
             state.lastKnownSize = windowSize(state.id)?.key;
           } catch (err) { warnCosmetic("inspect pane removal layout", err); }
-          scheduleRebalance(state);
+          applyRebalance(state);
         }
       }
     }

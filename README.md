@@ -17,7 +17,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-The default `balanced` layout uses a 2D split tree: it redistributes every managed pane after spawning or closing an agent, fills vacated rows/columns, and gives the orchestrator approximately 25% more space than each worker. Other tmux layouts are configurable. Manual zoom, unrelated panes, and manually changed layouts are respected.
+The default `balanced` layout uses a 2D split tree: it immediately redistributes every managed pane after spawning or closing an agent (including burst launches), fills vacated rows/columns, and gives the orchestrator approximately 25% more space than each worker. Other tmux layouts are configurable. Manual zoom, unrelated panes, and manually changed layouts are respected.
 
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
 

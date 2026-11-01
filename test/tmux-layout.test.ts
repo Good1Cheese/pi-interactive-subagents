@@ -198,11 +198,13 @@ describe("tmux layout and stable instance labels", () => {
   it("does not override a user's active tmux zoom", async () => {
     await withFakeTmux(async (ctx) => {
       configureTmuxSurfaces(baseConfig);
-      const pane = createSurface("zoom-scout");
+      const first = createSurface("first");
+      const second = createSurface("second");
+      const beforeZoom = ctx.trace().length;
       ctx.mutate((state) => { (state.windows["@7"] as any).zoomed = true; });
-      await tick();
-      assert.ok(!has(ctx.trace(), "select-layout", ["tiled"]));
-      closeSurface(pane);
+      closeSurface(second);
+      assert.ok(!has(ctx.trace().slice(beforeZoom), "select-layout"));
+      closeSurface(first);
     });
   });
 
