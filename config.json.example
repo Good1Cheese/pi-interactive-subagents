@@ -1,6 +1,11 @@
 {
-  "status": {
-    "enabled": true
+  "status": { "enabled": true },
+  "tmux": {
+    "mode": "panes",
+    "layout": "tiled",
+    "labels": "bottom",
+    "keepCompletedWindows": false,
+    "maxRetainedWindows": 4
   },
-  "childExtensions": []
+  "names": { "fallback": "random" }
 }

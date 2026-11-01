@@ -22,6 +22,15 @@ test("spawn and resume preserve YAML tool arrays and the absent-tools default", 
     process.env.TMUX = "fake"; process.env.TMUX_PANE = "%1";
     process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
     process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+    // Exercise the pane-oriented legacy launch tests regardless of the real user's
+    // XDG configuration (which can legitimately set tmux.mode = "windows").
+    process.env.XDG_CONFIG_HOME = join(root, "xdg-config");
+    const isolatedConfigDir = join(process.env.XDG_CONFIG_HOME, "pi-interactive-subagents");
+    mkdirSync(isolatedConfigDir, { recursive: true });
+    writeFileSync(join(isolatedConfigDir, "config.json"), JSON.stringify({
+      status: { enabled: true },
+      tmux: { mode: "panes", layout: "tiled", labels: "bottom" },
+    }));
     process.env.TMUX_LOG = join(root, "tmux.log");
     const bin = join(root, "bin"); mkdirSync(bin);
     writeFileSync(join(bin, "tmux"), '#!/bin/sh\necho "$*" >> "$TMUX_LOG"\n[ "$1" = split-window ] && echo %123\nexit 0\n', { mode: 0o700 });

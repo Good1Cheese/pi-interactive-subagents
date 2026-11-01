@@ -1,7 +1,7 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -44,6 +44,7 @@ import {
   formatTransitionLine,
   observeStatus,
   loadStatusConfig,
+  loadSubagentRootConfig,
   parseStatusConfig,
 } from "../pi-extension/subagents/status.ts";
 import {
@@ -688,6 +689,8 @@ describe("status.ts", () => {
     assert.deepEqual(disabled, {
       enabled: false,
       lineLimit: 4,
+      tmux: { mode: "panes", layout: "tiled", labels: "bottom", keepCompletedWindows: false, maxRetainedWindows: 4 },
+      names: { fallback: "random" },
     });
   });
 
@@ -698,6 +701,8 @@ describe("status.ts", () => {
     assert.deepEqual(config, {
       enabled: true,
       lineLimit: 4,
+      tmux: { mode: "panes", layout: "tiled", labels: "bottom", keepCompletedWindows: false, maxRetainedWindows: 4 },
+      names: { fallback: "random" },
     });
   });
 
@@ -714,6 +719,8 @@ describe("status.ts", () => {
       assert.deepEqual(config, {
         enabled: true,
         lineLimit: 4,
+        tmux: { mode: "panes", layout: "tiled", labels: "bottom", keepCompletedWindows: false, maxRetainedWindows: 4 },
+        names: { fallback: "random" },
       });
     });
   });
@@ -727,6 +734,98 @@ describe("status.ts", () => {
       () => parseStatusConfig({ status: { enabled: true, defaultCadenceSeconds: 60 } }),
       /status has unsupported key\(s\): defaultCadenceSeconds/,
     );
+  });
+
+  it("supports tiled panes or full-window tabs without accepting typos", () => {
+    const windows = parseStatusConfig({
+      status: { enabled: true },
+      tmux: { mode: "windows", layout: "main-vertical", labels: "off" },
+      names: { fallback: "numbered" },
+    });
+    assert.deepEqual(windows.tmux, { mode: "windows", layout: "main-vertical", labels: "off", keepCompletedWindows: false, maxRetainedWindows: 4 });
+    assert.deepEqual(windows.names, { fallback: "numbered" });
+    assert.throws(() => parseStatusConfig({ status: { enabled: true }, tmux: { mode: "grid" } }), /tmux.mode must be one of/);
+    assert.throws(() => parseStatusConfig({ status: { enabled: true }, tmux: { layout: "columns" } }), /tmux.layout must be one of/);
+    assert.throws(() => parseStatusConfig({ status: { enabled: true }, tmux: { unexpected: true } }), /tmux has unsupported key/);
+    assert.throws(() => parseStatusConfig({ status: { enabled: true }, tmux: { keepCompletedWindows: 1 } }), /tmux.keepCompletedWindows must be a boolean/);
+    assert.throws(() => parseStatusConfig({ status: { enabled: true }, tmux: { maxRetainedWindows: 0 } }), /tmux.maxRetainedWindows must be an integer/);
+    assert.throws(() => parseStatusConfig({ status: { enabled: true }, names: { fallback: "auto" } }), /names.fallback must be one of/);
+    assert.throws(() => parseStatusConfig({ status: { enabled: true }, names: { randomized: true } }), /names has unsupported key/);
+  });
+
+  it("prioritizes a stable XDG user config over a managed package config", () => {
+    withTempDir((dir) => {
+      const previous = process.env.XDG_CONFIG_HOME;
+      const configDir = join(dir, "pi-interactive-subagents");
+      mkdirSync(configDir, { recursive: true });
+      writeFileSync(join(configDir, "config.json"), JSON.stringify({ status: { enabled: false }, tmux: { mode: "windows" } }));
+      try {
+        process.env.XDG_CONFIG_HOME = dir;
+        const config = loadStatusConfig();
+        assert.equal(config.enabled, false);
+        assert.equal(config.tmux.mode, "windows");
+      } finally {
+        restoreEnvVar("XDG_CONFIG_HOME", previous);
+      }
+    });
+  });
+
+  it("merges UI overrides without losing an existing childExtensions allowlist", () => {
+    withTempDir((dir) => {
+      const legacy = join(dir, "config.json");
+      const example = join(dir, "config.json.example");
+      const xdg = join(dir, "xdg", "config.json");
+      mkdirSync(dirname(xdg), { recursive: true });
+      writeFileSync(legacy, JSON.stringify({ status: { enabled: true }, childExtensions: ["/trusted/provider.ts"] }));
+      writeFileSync(xdg, JSON.stringify({ tmux: { mode: "windows", maxRetainedWindows: 2 }, names: { fallback: "numbered" } }));
+      const merged = loadSubagentRootConfig(legacy, example, xdg);
+      assert.deepEqual(merged.childExtensions, ["/trusted/provider.ts"]);
+      assert.deepEqual(loadStatusConfig(legacy, example, xdg).tmux, {
+        mode: "windows", layout: "tiled", labels: "bottom",
+        keepCompletedWindows: false, maxRetainedWindows: 2,
+      });
+      assert.deepEqual(loadStatusConfig(legacy, example, xdg).names, { fallback: "numbered" });
+    });
+  });
+
+  it("fails closed if an XDG allowlist attempts to silently replace a legacy one", () => {
+    withTempDir((dir) => {
+      const legacy = join(dir, "config.json");
+      const example = join(dir, "config.json.example");
+      const xdg = join(dir, "xdg", "config.json");
+      mkdirSync(dirname(xdg), { recursive: true });
+      writeFileSync(legacy, JSON.stringify({ status: { enabled: true }, childExtensions: ["/trusted/provider.ts"] }));
+      writeFileSync(xdg, JSON.stringify({ status: { enabled: true }, childExtensions: [] }));
+      assert.throws(() => loadSubagentRootConfig(legacy, example, xdg), /childExtensions conflicts/);
+      writeFileSync(xdg, JSON.stringify({ childExtensions: ["/trusted/provider.ts"] }));
+      assert.deepEqual(loadSubagentRootConfig(legacy, example, xdg).childExtensions, ["/trusted/provider.ts"]);
+    });
+  });
+
+  it("does not synthesize an invalid childExtensions key for UI-only XDG configs", () => {
+    withTempDir((dir) => {
+      const legacy = join(dir, "missing.json");
+      const example = join(dir, "config.json.example");
+      const xdg = join(dir, "xdg", "config.json");
+      mkdirSync(dirname(xdg), { recursive: true });
+      writeFileSync(example, JSON.stringify({ status: { enabled: true } }));
+      writeFileSync(xdg, JSON.stringify({ tmux: { mode: "windows" } }));
+      const merged = loadSubagentRootConfig(legacy, example, xdg);
+      assert.equal(Object.hasOwn(merged, "childExtensions"), false);
+      assert.deepEqual((subagentsModule as any).__test__.parseConfiguredExtensions(merged), []);
+    });
+  });
+
+  it("accepts XDG-only childExtensions if no legacy custom allowlist exists", () => {
+    withTempDir((dir) => {
+      const legacy = join(dir, "missing.json");
+      const example = join(dir, "config.json.example");
+      const xdg = join(dir, "xdg", "config.json");
+      mkdirSync(dirname(xdg), { recursive: true });
+      writeFileSync(example, JSON.stringify({ status: { enabled: true } }));
+      writeFileSync(xdg, JSON.stringify({ childExtensions: ["/trusted/tool.ts"] }));
+      assert.deepEqual(loadSubagentRootConfig(legacy, example, xdg).childExtensions, ["/trusted/tool.ts"]);
+    });
   });
 
   it("reports when neither local nor shared config exists", () => {
@@ -2554,6 +2653,21 @@ describe("subagent startup delay", () => {
     }
   });
 });
+describe("automatically named subagents", () => {
+  it("generates a short role-prefixed fallback for an unnamed worker", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const name = testApi.fallbackSubagentName("scout", "random", "cedar");
+    assert.equal(name, "scout-cedar");
+    assert.equal(testApi.fallbackSubagentName("scout", "numbered"), "scout");
+    assert.equal(testApi.uniqueRunningName("scout", new Set(["scout"])), "scout-2");
+    assert.ok(name.length <= 25, `name should be compact, got ${name}`);
+    assert.equal(testApi.validSubagentName("auth-scout"), true);
+    assert.equal(testApi.validSubagentName("foo\u202e"), false);
+    assert.equal(testApi.validSubagentName("#[fg=red]"), false);
+    assert.equal(testApi.validSubagentName("x".repeat(120)), false);
+  });
+});
+
 describe("subagents widget rendering", () => {
   it("keeps every rendered line within a very narrow width", () => {
     const testApi = (subagentsModule as any).__test__;

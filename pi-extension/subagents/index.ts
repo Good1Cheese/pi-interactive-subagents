@@ -4,7 +4,7 @@ import { Type, type Static } from "typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
+import { randomInt, randomUUID } from "node:crypto";
 import { ensurePrivateDir, writePrivateFile } from "./private-files.ts";
 import {
   readdirSync,
@@ -20,10 +20,13 @@ import {
   isMuxAvailable,
   muxSetupHint,
   createSurface,
+  configureTmuxSurfaces,
+  tmuxSurfaceStatus,
   sendCommand,
   sendLongCommand,
   pollForExit,
   closeSurface,
+  isCleanSurfaceCompletion,
   shellEscape,
   readScreen,
 } from "./tmux.ts";
@@ -56,6 +59,7 @@ import {
   formatTransitionLine,
   observeStatus,
   loadStatusConfig,
+  loadSubagentRootConfig,
 } from "./status.ts";
 import {
   getSubagentActivityFile,
@@ -105,8 +109,9 @@ const SubagentParams = Type.Object({
   name: Type.Optional(
     Type.String({
       description:
-        "Optional cosmetic label for the subagent's pane and widget row. Defaults to the agent name. " +
-        "Has no effect on which agent runs — use `agent` for that.",
+        "Optional cosmetic, unique instance name, e.g. 'auth-scout' or 'api-tests'; appears in tmux and widget. " +
+        "Prefer a short task-based name. If omitted, generates a stable random name such as 'scout-cedar'. " +
+        "Use this exact name for subagent_message; agent selects the profile.",
     }),
   ),
   model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
@@ -460,8 +465,7 @@ function parseConfiguredExtensions(config: unknown): string[] {
 }
 
 function configuredExtensions(): string[] {
-  const path = join(SUBAGENTS_DIR, "../../config.json");
-  return existsSync(path) ? parseConfiguredExtensions(JSON.parse(readFileSync(path, "utf8"))) : [];
+  return parseConfiguredExtensions(loadSubagentRootConfig());
 }
 
 function formatElapsed(seconds: number): string {
@@ -572,6 +576,7 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
 }
 
 const statusConfig = loadStatusConfig();
+configureTmuxSurfaces(statusConfig.tmux);
 
 function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
   if (snapshot.kind === "starting") return " starting… ";
@@ -984,6 +989,25 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
  */
 const reservedNames = new Set<string>();
 const reservedSessions = new Set<string>();
+
+// Short memorable names when the orchestrator did not specify a task-based one.
+// Not used as an ID: session identity remains the UUID / session file.
+const NAME_WORDS = [
+  "amber", "birch", "cedar", "comet", "coral", "dawn", "delta", "ember",
+  "fern", "fjord", "flint", "frost", "grove", "harbor", "hazel", "iris",
+  "jade", "kestrel", "lumen", "maple", "moss", "nova", "onyx", "otter",
+  "pine", "quartz", "raven", "ridge", "river", "sage", "solstice", "willow",
+] as const;
+
+function fallbackSubagentName(
+  agent: string,
+  mode: "random" | "numbered",
+  word?: (typeof NAME_WORDS)[number],
+): string {
+  return mode === "random"
+    ? `${agent}-${word ?? NAME_WORDS[randomInt(NAME_WORDS.length)]}`
+    : agent;
+}
 let lifecycleAbort = new AbortController();
 function hasOwnedWork(): boolean {
   return runningSubagents.size > 0 || reservedNames.size > 0 || reservedSessions.size > 0;
@@ -998,7 +1022,11 @@ async function waitForShell(signal: AbortSignal): Promise<void> {
   signal.throwIfAborted();
 }
 function validSubagentName(name: string): boolean {
-  return !/[\x00-\x1f\x7f-\x9f]/.test(name);
+  const normalized = name.trim();
+  // Keep the exact name as the registry key, but never allow invisible, bidi,
+  // tmux-format or unbounded identifiers from a model-generated suggestion.
+  return normalized.length > 0 && Array.from(normalized).length <= 96 &&
+    !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(name) && !normalized.includes("#[");
 }
 
 /**
@@ -1173,6 +1201,7 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
 }
 
 export const __test__ = {
+  fallbackSubagentName,
   borderLine,
   getShellReadyDelayMs,
   renderSubagentWidgetLines,
@@ -1642,7 +1671,7 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      closeSurface(surface);
+      closeSurface(surface, { completed: isCleanSurfaceCompletion(result) });
       runningSubagents.delete(running.id);
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
@@ -1670,7 +1699,7 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    try { closeSurface(surface); } catch { /* pane may already be gone */ }
+    try { closeSurface(surface, { completed: isCleanSurfaceCompletion(result) }); } catch { /* pane may already be gone */ }
     runningSubagents.delete(running.id);
 
     return {
@@ -1888,9 +1917,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // synchronously (before any await) so parallel spawns don't collide.
         const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
         if (params.name && !validSubagentName(params.name)) {
-          throw new Error("Subagent name must not contain control characters");
+          throw new Error("Subagent name must be 1-96 visible characters and contain no control, bidi or tmux format sequences");
         }
-        if (!params.name?.trim()) params.name = uniqueRunningName(params.agent, registryNames);
+        if (!params.name?.trim()) params.name = uniqueRunningName(fallbackSubagentName(params.agent, statusConfig.names.fallback), registryNames);
         else params.name = params.name.trim();
         if (registryNames.has(params.name) || reservedNames.has(params.name) || [...runningSubagents.values()].some((r) => r.name === params.name)) {
           throw new Error(`Subagent name already exists: ${params.name}`);
@@ -2433,7 +2462,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
-  // /subagent command — spawn a subagent by name
+  // Inspect layout, owned pane/window counts, and recoverable cosmetic warnings.
+  pi.registerCommand("subagent-tmux-status", {
+    description: "Show tmux layout mode, managed agent surfaces and warnings",
+    handler: async (_args, ctx) => { ctx.ui.notify(tmuxSurfaceStatus(), "info"); },
+  });
+
+  // /subagent command - spawn a subagent by name
   pi.registerCommand("subagent", {
     description: "Spawn a subagent: /subagent <agent> <task>",
     handler: async (args, ctx) => {
@@ -2457,8 +2492,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
 
       const taskText = task || `You are the ${agentName} agent. Wait for instructions.`;
-      const displayName = agentName[0].toUpperCase() + agentName.slice(1);
-      const toolCall = `Use subagent with agent: "${agentName}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
+      // Let the usual fallback generate a unique readable instance name.
+      const toolCall = `Use subagent with agent: ${JSON.stringify(agentName)}, task: ${JSON.stringify(taskText)}`;
       pi.sendUserMessage(toolCall);
     },
   });
