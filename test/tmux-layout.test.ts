@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createWeightedLayout } from "../pi-extension/subagents/weighted-layout.ts";
 import {
   configureTmuxSurfaces, createSurface, closeSurface, PANE_BORDER_FORMAT,
-  tmuxDisplayName, tmuxSurfaceStatus, isCleanSurfaceCompletion, __resetTmuxRuntimeForTest,
+  tmuxDisplayName, tmuxSurfaceStatus, isCleanSurfaceCompletion, rebalanceCurrentTmuxWindow, __resetTmuxRuntimeForTest,
 } from "../pi-extension/subagents/tmux.ts";
 import type { TmuxSurfaceConfig } from "../pi-extension/subagents/tmux.ts";
 
@@ -205,6 +205,39 @@ describe("tmux layout and stable instance labels", () => {
       closeSurface(second);
       assert.ok(!has(ctx.trace().slice(beforeZoom), "select-layout"));
       closeSurface(first);
+    });
+  });
+
+  it("explicitly rebalances a manually changed, fully-owned pane window", async () => {
+    await withFakeTmux(async (ctx) => {
+      configureTmuxSurfaces({ ...baseConfig, layout: "balanced", mainPaneWeight: 1.25 });
+      createSurface("scout");
+      ctx.mutate((state) => { state.windows["@7"].layout = "user-layout"; });
+      const result = rebalanceCurrentTmuxWindow();
+      assert.deepEqual(result, { ok: true, message: "Rebalanced 2 managed panes using balanced layout." });
+      const custom = ctx.trace().filter(args => args[0] === "select-layout" && args.at(-1)?.includes(","));
+      assert.equal(custom.at(-1)?.at(-1), createWeightedLayout(170, 45, 2, 1.25)!.layout);
+      assert.equal(ctx.read().windows["@7"].panes.length, 2);
+    });
+  });
+
+  it("refuses manual rebalancing when panes are foreign or the window is zoomed", async () => {
+    await withFakeTmux(async (ctx) => {
+      configureTmuxSurfaces(baseConfig);
+      createSurface("scout");
+      ctx.mutate((state) => { state.windows["@7"].panes.push("%105"); });
+      const beforeForeign = ctx.trace().length;
+      const foreign = rebalanceCurrentTmuxWindow();
+      assert.equal(foreign.ok, false);
+      assert.match(foreign.message, /unmanaged or pre-existing panes/);
+      assert.ok(!has(ctx.trace().slice(beforeForeign), "select-layout"));
+      ctx.mutate((state) => { state.windows["@7"].panes.pop(); (state.windows["@7"] as any).zoomed = true; });
+      const beforeZoom = ctx.trace().length;
+      const zoomed = rebalanceCurrentTmuxWindow();
+      assert.equal(zoomed.ok, false);
+      assert.match(zoomed.message, /Unzoom it/);
+      assert.ok(!has(ctx.trace().slice(beforeZoom), "select-layout"));
+      assert.equal(ctx.read().windows["@7"].panes.length, 2);
     });
   });
 

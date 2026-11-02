@@ -34,7 +34,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
 
-There is also a `/subagent <agent> <task>` command for spawning directly.
+There is also a `/subagent <agent> <task>` command for spawning directly. In a tmux TUI session, `/subagent-rebalance` explicitly restores the configured layout for the current fully managed pane window after a manual resize or rearrangement; it refuses windows with foreign panes and asks you to unzoom first rather than changing zoom state. It never closes or restarts panes. RPC sessions do not support this command.
 
 ### Spawning
 
@@ -210,7 +210,10 @@ do not want the plugin to leave finished shells/windows in your tmux session.
   the parent window originally contains a single pane and still contains only
   the Pi pane plus its managed children. If another pane is present, the plugin
   will not re-layout it. Manual changes disable automatic re-layout for that
-  managed window. A terminal resize is not mistaken for a manual edit.
+  managed window. A terminal resize is not mistaken for a manual edit. Explicitly run
+  `/subagent-rebalance` to reclaim automatic layout for the current managed window after
+  a manual resize or rearrangement; ordinary subagent spawns continue respecting manual
+  layout changes unless this command is invoked.
   Existing multi-pane geometry is restored when safe.
 - Pane-border and pane-label options are **window/pane-local**. Original local
   values, including unset/inherited values, are restored after the last managed

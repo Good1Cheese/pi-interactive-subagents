@@ -24,6 +24,7 @@ import {
   createSurface,
   configureTmuxSurfaces,
   tmuxSurfaceStatus,
+  rebalanceCurrentTmuxWindow,
   sendLongCommand,
   pollForExit,
   closeSurface,
@@ -2735,6 +2736,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
       },
     });
+
+  // Explicitly reclaim the configured layout for the current owned pane window.
+  pi.registerCommand("subagent-rebalance", {
+    description: "Rebalance the current managed tmux pane layout",
+    handler: async (_args, ctx) => {
+      if (ctx.mode === "rpc") {
+        ctx.ui.notify("Pane rebalancing is only available in a tmux TUI session.", "warning");
+        return;
+      }
+      const result = rebalanceCurrentTmuxWindow();
+      ctx.ui.notify(result.message, result.ok ? "info" : "warning");
+    },
+  });
 
   // Inspect layout, owned pane/window counts, and recoverable cosmetic warnings.
   pi.registerCommand("subagent-tmux-status", {

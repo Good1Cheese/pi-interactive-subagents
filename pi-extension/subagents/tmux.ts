@@ -278,8 +278,8 @@ function verifyLayoutOwner(state: ManagedWindow): void {
   } catch (err) { state.automaticLayout = false; warnCosmetic("inspect window layout", err); }
 }
 
-function canRebalance(state: ManagedWindow): boolean {
-  if (!state.automaticLayout || state.children.size === 0 || state.baselinePanes.size !== 1) return false;
+function canRebalance(state: ManagedWindow, manual = false): boolean {
+  if ((!manual && !state.automaticLayout) || state.children.size === 0 || state.baselinePanes.size !== 1) return false;
   // Never discard an active tmux zoom to improve an automatic layout.
   try {
     if (tmux("display-message", "-p", "-t", state.id, "#{window_zoomed_flag}") === "1") return false;
@@ -294,10 +294,15 @@ function canRebalance(state: ManagedWindow): boolean {
 }
 
 /** Realign every surviving pane after joins/leaves, with no empty bottom rows. */
-function applyRebalance(state: ManagedWindow): void {
-  if (!canRebalance(state)) return;
+function applyRebalance(state: ManagedWindow, manual = false): boolean {
+  if (!canRebalance(state, manual)) return false;
+  if (manual) {
+    state.automaticLayout = true;
+    state.lastKnownLayout = windowLayout(state.id);
+    state.lastKnownSize = windowSize(state.id)?.key;
+  }
   verifyLayoutOwner(state);
-  if (!state.automaticLayout) return;
+  if (!state.automaticLayout) return false;
   try {
     const ids = [...listWindowPanes(state.id)];
     if (surfaceConfig.layout === "balanced") {
@@ -319,6 +324,7 @@ function applyRebalance(state: ManagedWindow): void {
     }
     state.lastKnownLayout = windowLayout(state.id);
     state.lastKnownSize = windowSize(state.id)?.key;
+    return true;
   } catch (err) {
     warnCosmetic("could not rebalance panes", err);
     // Older tmux versions or a very small terminal may reject a custom
@@ -328,8 +334,40 @@ function applyRebalance(state: ManagedWindow): void {
         tmux("select-layout", "-t", state.id, "tiled");
         state.lastKnownLayout = windowLayout(state.id);
         state.lastKnownSize = windowSize(state.id)?.key;
+        return true;
       } catch (fallbackError) { warnCosmetic("balanced layout tiled fallback failed", fallbackError); }
     }
+    return false;
+  }
+}
+
+/** Explicitly restore configured geometry for the current, fully-owned pane window. */
+export function rebalanceCurrentTmuxWindow(): { ok: boolean; message: string } {
+  if (!isTmuxAvailable()) return { ok: false, message: "Pane rebalancing is only available in a tmux TUI session." };
+  const parent = process.env.TMUX_PANE;
+  if (!parent) return { ok: false, message: "Cannot rebalance: TMUX_PANE does not identify this Pi pane." };
+  try {
+    const id = windowIdOf(parent);
+    const state = runtime.windows.get(id);
+    if (!state || state.parent !== parent || state.baselinePanes.size !== 1 || !state.baselinePanes.has(parent)) {
+      return { ok: false, message: "Cannot rebalance: this window is not an owned subagent pane layout." };
+    }
+    if (tmux("display-message", "-p", "-t", id, "#{window_zoomed_flag}") === "1") {
+      return { ok: false, message: "Cannot rebalance while the tmux window is zoomed. Unzoom it with Ctrl+b z, then retry." };
+    }
+    const allowed = new Set([parent, ...state.children]);
+    const actual = listWindowPanes(id);
+    if (actual.size !== allowed.size || [...actual].some((pane) => !allowed.has(pane)) ||
+      [...state.children].some((pane) => runtime.surfaces.get(pane)?.windowId !== id)) {
+      return { ok: false, message: "Cannot rebalance: this window contains unmanaged or pre-existing panes; no panes were changed." };
+    }
+    if (!applyRebalance(state, true)) {
+      return { ok: false, message: "Could not rebalance this pane layout; no panes were closed or restarted." };
+    }
+    return { ok: true, message: `Rebalanced ${actual.size} managed panes using ${surfaceConfig.layout} layout.` };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return { ok: false, message: `Cannot rebalance current tmux window: ${detail}` };
   }
 }
 

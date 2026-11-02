@@ -1897,6 +1897,25 @@ describe("commands", () => {
     assert.match(sentUserMessages[0], /map the auth code/);
   });
 
+  it("registers /subagent-rebalance and explains that it is unavailable in RPC mode", async () => {
+    const { api, registeredCommands } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const command = registeredCommands.find((entry) => entry.name === "subagent-rebalance");
+    assert.ok(command, "expected /subagent-rebalance to be registered");
+    const notices: Array<{ message: string; level: string }> = [];
+    await command.handler("", { mode: "rpc", ui: { notify: (message: string, level: string) => notices.push({ message, level }) } });
+    assert.deepEqual(notices, [{ message: "Pane rebalancing is only available in a tmux TUI session.", level: "warning" }]);
+    const previousTmux = process.env.TMUX;
+    delete process.env.TMUX;
+    try {
+      await command.handler("", { ui: { notify: (message: string, level: string) => notices.push({ message, level }) } });
+    } finally {
+      if (previousTmux === undefined) delete process.env.TMUX;
+      else process.env.TMUX = previousTmux;
+    }
+    assert.deepEqual(notices[1], { message: "Pane rebalancing is only available in a tmux TUI session.", level: "warning" });
+  });
+
   it("does not register the removed /iterate or /plan commands", () => {
     const { api, registeredCommands } = createMockExtensionApi();
     (subagentsModule as any).default(api);
