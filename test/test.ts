@@ -34,12 +34,12 @@ import {
 } from "../pi-extension/subagents/session.ts";
 
 import { shellEscape } from "../pi-extension/subagents/tmux.ts";
+import { createSteeringEndpoint, startSteeringReceiver } from "../pi-extension/subagents/steering.ts";
 import {
   advanceStatusState,
   capStatusLines,
   classifyStatus,
   createStatusState,
-  forceStatusAfterInterrupt,
   formatStatusAggregate,
   formatStatusLine,
   formatTransitionLine,
@@ -60,7 +60,7 @@ import {
   runningChildrenCount,
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/tmux.ts";
+import { interpretExitSidecar } from "../pi-extension/subagents/tmux.ts";
 
 // --- Helpers ---
 
@@ -140,16 +140,6 @@ function restoreEnvVar(name: string, value: string | undefined) {
     return;
   }
   process.env[name] = value;
-}
-
-function withMockedNow<T>(now: number, fn: () => T): T {
-  const originalNow = Date.now;
-  Date.now = () => now;
-  try {
-    return fn();
-  } finally {
-    Date.now = originalNow;
-  }
 }
 
 function writeAgentFile(
@@ -977,31 +967,6 @@ describe("status.ts", () => {
     assert.equal(snapshot.statusLabel, null);
   });
 
-  it("forces an active state to waiting after interrupt", () => {
-    const now = 20_000;
-    let state = createStatusState({ source: "pi", startTimeMs: 0 });
-    state = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 5_000,
-      sequence: 1,
-      phase: "active",
-      active: true,
-      activeScope: "tool",
-      activeSince: 5_000,
-      activityLabel: "bash",
-    }, 5_000);
-
-    assert.equal(classifyStatus(state, now).kind, "active");
-
-    const forced = forceStatusAfterInterrupt(state, now);
-    const snapshot = classifyStatus(forced, now);
-
-    assert.equal(snapshot.kind, "waiting");
-    assert.equal(snapshot.activityLabel, "interrupted");
-    assert.equal(snapshot.waitingDurationText, "0s");
-    assert.equal(forced.activeNow, false);
-  });
-
   it("orders same-millisecond snapshots by sequence", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
     state = observeStatus(state, {
@@ -1058,63 +1023,6 @@ describe("status.ts", () => {
     const snapshot = classifyStatus(state, 11_000);
     assert.equal(snapshot.kind, "active");
     assert.equal(snapshot.statusLabel, null);
-  });
-
-  it("ignores stale and exact old snapshots after interrupt and accepts newer snapshots", () => {
-    let state = createStatusState({ source: "pi", startTimeMs: 0 });
-    state = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 5_000,
-      sequence: 1,
-      phase: "active",
-      active: true,
-      activeScope: "tool",
-      activeSince: 5_000,
-      activityLabel: "bash",
-    }, 5_000);
-    state = forceStatusAfterInterrupt(state, 20_000);
-
-    const stale = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 5_000,
-      sequence: 1,
-      phase: "active",
-      active: true,
-      activeScope: "tool",
-      activeSince: 5_000,
-      activityLabel: "bash",
-    }, 21_000);
-    let snapshot = classifyStatus(stale, 21_000);
-    assert.equal(snapshot.kind, "waiting");
-    assert.equal(snapshot.activityLabel, "interrupted");
-
-    const sameTimestamp = observeStatus(stale, {
-      snapshot: "present",
-      updatedAt: 20_000,
-      sequence: 1,
-      phase: "active",
-      active: true,
-      activeScope: "tool",
-      activeSince: 20_000,
-      activityLabel: "bash",
-    }, 22_000);
-    snapshot = classifyStatus(sameTimestamp, 22_000);
-    assert.equal(snapshot.kind, "waiting");
-    assert.equal(snapshot.activityLabel, "interrupted");
-
-    const resumed = observeStatus(sameTimestamp, {
-      snapshot: "present",
-      sequence: 2,
-      updatedAt: 25_000,
-      phase: "active",
-      active: true,
-      activeScope: "streaming",
-      activeSince: 25_000,
-      activityLabel: "streaming",
-    }, 25_000);
-    snapshot = classifyStatus(resumed, 25_000);
-    assert.equal(snapshot.kind, "active");
-    assert.equal(resumed.activeScope, "streaming");
   });
 
   it("normalizes and truncates long newline-heavy names", () => {
@@ -1488,11 +1396,7 @@ describe("subagent discovery", () => {
       assert.ok(parts.includes("--no-extensions"), "expected --no-extensions");
       const toolsIdx = parts.indexOf("--tools");
       assert.ok(toolsIdx >= 0, "expected --tools");
-      // The value is shell-escaped (single-quoted) before joining.
-      assert.ok(
-        parts[toolsIdx + 1].includes("read,write,safe_bash"),
-        "expected the tool allowlist as the --tools value",
-      );
+      assert.equal(parts[toolsIdx + 1], "read,write,safe_bash", "argv values stay raw until tmux serialization");
     });
   });
 
@@ -1537,6 +1441,13 @@ describe("subagent discovery", () => {
     assert.deepEqual(
       testApi.buildPiPromptArgs({ effectiveSkills: "review", taskDelivery: "direct", taskArg: "do the task" }),
       ["do the task"],
+    );
+  });
+
+  it("leaves all RPC prompt delivery to the initial RPC message", () => {
+    assert.deepEqual(
+      testApi.buildPiPromptArgs({ taskDelivery: "artifact", taskArg: "@task.md", mode: "rpc" }),
+      [],
     );
   });
 
@@ -1924,7 +1835,6 @@ describe("subagent-done.ts", () => {
 });
 
 describe("tmux.ts interpretExitSidecar", () => {
-  const { interpretExitSidecar } = __pollForExitTest__;
 
   it("no longer decodes ping payloads (ask_question keeps the session open instead)", () => {
     // ask_question writes a `.ask` signal, not a `.exit` ping sidecar, so an
@@ -2284,7 +2194,7 @@ describe("subagent activity snapshots", () => {
   });
 });
 
-describe("subagent interruption", () => {
+describe("subagent steering", () => {
   function makeRunning(overrides: Record<string, unknown> = {}) {
     return {
       id: "a1",
@@ -2396,123 +2306,68 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("steers a running subagent by typing into its pane (newlines flattened)", () => {
-    const testApi = (subagentsModule as any).__test__;
-    let sentSurface = "";
-    let sentText = "";
-    const running = makeRunning();
-
-    const result = testApi.steerSubagent(running, "do this\nthen that", (surface: string, text: string) => {
-      sentSurface = surface;
-      sentText = text;
-    });
-
-    assert.deepEqual(result, { ok: true });
-    assert.equal(sentSurface, "pane-1");
-    assert.equal(sentText, "do this then that");
-  });
-
-  it("returns an explicit error when steering delivery fails", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const running = makeRunning();
-
-    const result = testApi.steerSubagent(running, "hi", () => {
-      throw new Error("mux write failed");
-    });
-
-    assert.match(result.error, /Failed to deliver message/);
-  });
-
-  it("delivers a steer message and forces local status waiting", () => {
+  it("queues an asynchronous steer over the local socket without flattening text or changing active telemetry", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
-    let sentSurface = "";
-    let sentText = "";
+    const endpoint = createSteeringEndpoint();
+    const message = "do this\nthen that";
+    const received: string[] = [];
+    const close = await startSteeringReceiver({ sendUserMessage(text) { received.push(text); } }, endpoint.socketPath, endpoint.generation);
+    const activeState = observeStatus(createStatusState({ source: "pi", startTimeMs: 0 }), {
+      snapshot: "present", updatedAt: 5_000, sequence: 1, phase: "active", active: true,
+      activeScope: "tool", activeSince: 5_000, activityLabel: "bash",
+    }, 5_000);
+
     runningMap.clear();
-
-    const activeState = observeStatus(
-      createStatusState({ source: "pi", startTimeMs: 0 }),
-      {
-        snapshot: "present",
-        updatedAt: 5_000,
-        sequence: 1,
-        phase: "active",
-        active: true,
-        activeScope: "tool",
-        activeSince: 5_000,
-        activityLabel: "bash",
-      },
-      5_000,
-    );
-
+    runningMap.set("a1", makeRunning({ steering: endpoint, statusState: activeState }));
     try {
-      runningMap.set("a1", makeRunning({ statusState: activeState }));
-
-      const result = withMockedNow(20_000, () =>
-        testApi.handleSubagentSteer({ name: "Worker", message: "keep going" }, (surface: string, text: string) => {
-          sentSurface = surface;
-          sentText = text;
-        }),
-      );
-
-      assert.equal(sentSurface, "pane-1");
-      assert.equal(sentText, "keep going");
-      assert.equal(result.content[0].text.includes('Message delivered to running subagent "Worker"'), true);
+      const result = await testApi.handleSubagentSteer({ name: "Worker", message });
+      assert.deepEqual(received, [message]);
+      assert.match(result.content[0].text, /accepted into Pi's queue/);
+      assert.match(result.content[0].text, /Consumption and application are not confirmed/);
       assert.deepEqual(result.details, { id: "a1", name: "Worker", status: "steered" });
-      const snapshot = classifyStatus(runningMap.get("a1").statusState, 20_000);
-      assert.equal(snapshot.kind, "waiting");
-      assert.equal(runningMap.has("a1"), true);
+      assert.equal(classifyStatus(runningMap.get("a1").statusState, Date.now()).kind, "active");
     } finally {
       runningMap.clear();
+      await close();
+      endpoint.dispose();
     }
   });
 
-  it("requires a message when steering", () => {
+  it("requires a message when steering", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
     try {
       runningMap.set("a1", makeRunning());
-      const result = testApi.handleSubagentSteer({ name: "Worker", message: "  " }, () => {});
+      const result = await testApi.handleSubagentSteer({ name: "Worker", message: "  " });
       assert.match(result.content[0].text, /`message` is required/);
     } finally {
       runningMap.clear();
     }
   });
 
-  it("leaves status unchanged when steering delivery fails in the tool path", () => {
+  it("reports refused and unknown socket deliveries without claiming they were queued", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
 
-    const activeState = observeStatus(
-      createStatusState({ source: "pi", startTimeMs: 0 }),
-      {
-        snapshot: "present",
-        updatedAt: 5_000,
-        sequence: 1,
-        phase: "active",
-        active: true,
-        activeScope: "tool",
-        activeSince: 5_000,
-        activityLabel: "bash",
-      },
-      5_000,
-    );
-
+    const endpoint = createSteeringEndpoint();
+    const close = await startSteeringReceiver({ sendUserMessage() {} }, endpoint.socketPath, "another-generation");
     try {
-      runningMap.set("a1", makeRunning({ statusState: activeState }));
+      runningMap.set("a1", makeRunning({ steering: endpoint }));
+      const refused = await testApi.handleSubagentSteer({ name: "Worker", message: "go" });
+      assert.match(refused.content[0].text, /Steering rejected/);
+      assert.notEqual(refused.details.status, "steered");
 
-      const result = withMockedNow(20_000, () =>
-        testApi.handleSubagentSteer({ name: "Worker", message: "go" }, () => {
-          throw new Error("mux write failed");
-        }),
-      );
-
-      assert.match(result.content[0].text, /Failed to deliver message/);
-      assert.equal(classifyStatus(runningMap.get("a1").statusState, 20_000).kind, "active");
+      runningMap.set("a1", makeRunning({ steering: { ...endpoint, socketPath: `${endpoint.socketPath}.missing` } }));
+      const unknown = await testApi.handleSubagentSteer({ name: "Worker", message: "go" });
+      assert.match(unknown.content[0].text, /Steering unknown/);
+      assert.notEqual(unknown.details.status, "steered");
     } finally {
       runningMap.clear();
+      await close();
+      endpoint.dispose();
     }
   });
 
@@ -2536,12 +2391,9 @@ describe("subagent interruption", () => {
     assert.doesNotMatch(presentation, /Session id:/);
   });
 
-  it("renders a clear provider/agent error when errorMessage is set", () => {
-    // Previously, an overload retry-exhaustion produced exitCode 0 with a
-    // stale summary — the orchestrator thought the subagent finished
-    // quickly. With the error sidecar plumbed through, the presentation
-    // must call out the failure, include the underlying error, and tell the
-    // orchestrator how to recover.
+  it("renders a neutral error when errorMessage is set", () => {
+    // Error messages can describe provider failures or RPC/protocol failures;
+    // retain the cause without claiming a retry policy.
     const testApi = (subagentsModule as any).__test__;
     const presentation = testApi.resolveResultPresentation(
       {
@@ -2556,7 +2408,8 @@ describe("subagent interruption", () => {
     );
 
     assert.match(presentation, /Sub-agent "Worker" failed/);
-    assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
+    assert.match(presentation, /\(error\)/);
+    assert.doesNotMatch(presentation, /provider|agent-loop|retry exhausted/i);
     assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
     assert.match(presentation, /subagent_message\(\{ name: "Worker"/);
     assert.doesNotMatch(presentation, /Session id:/);

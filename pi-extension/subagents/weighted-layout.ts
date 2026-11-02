@@ -109,7 +109,9 @@ export function createWeightedLayout(
     || width < MIN_WIDTH || height < MIN_HEIGHT || paneCount < 1 || paneCount > 64
     || !Number.isFinite(mainWeight) || mainWeight < 1 || mainWeight > 2) return undefined;
   const weights = Array(paneCount).fill(1) as number[];
-  weights[0] = mainWeight;
+  // A configured weight of 1 is valid, but rounding can make a worker tie the
+  // orchestrator; keep the documented small area advantage in that case.
+  weights[0] = Math.max(mainWeight, 1.25);
   const panes: Rect[] = [];
   const tree = build({ x: 0, y: 0, width, height }, weights, 0, paneCount, panes);
   if (!tree) return undefined;

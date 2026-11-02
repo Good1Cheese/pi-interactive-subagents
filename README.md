@@ -1,12 +1,12 @@
 # pi-interactive-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
+Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux panes for TUI parents or as headless Pi RPC children for RPC parents. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
-**tmux-only fork.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
+**tmux for local TUI; headless for RPC.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own tmux pane — a right split off the parent pi pane, so pane creation never steals keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. With a TUI parent, the sub-agent runs in its own tmux pane — a right split off the parent pi pane, so pane creation never steals keyboard focus. With an RPC parent, it runs as a real Pi RPC process without tmux, positional prompts, or shell startup delays. Supported child dialogs are forwarded through the parent's UI; unsupported dialogs are cancelled. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -29,7 +29,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 
 | Tool | Description |
 | --- | --- |
-| `subagent` | Spawn a sub-agent in a dedicated tmux pane (async) |
+| `subagent` | Spawn a sub-agent in a tmux pane or headless RPC process (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
@@ -59,7 +59,7 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 subagent_message({ name: "scout", message: "Also check the auth middleware" });
 ```
 
-- **Running** — the message is typed into the live pane (newlines flattened) and picked up at the next turn boundary. The call returns immediately; the eventual completion still arrives as a steer message.
+- **Running** — the message goes through a generation-bound local socket (TUI) or the child's RPC channel, never terminal/shell input. Text and newlines are preserved. Acceptance means queued, not consumed or applied; a lost acknowledgement remains unknown and is not retried. The eventual completion still arrives as a steer message.
 - **Finished** — the session is resumed with the message as the follow-up task, like a fresh spawn: fire-and-forget, always autonomous, result steered back later. The resumed run reclaims its original name.
 
 Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.
@@ -258,7 +258,7 @@ If a legacy or missing loadout prevents resume, start a fresh subagent with a re
 ## Requirements
 
 - [Earendil Works Pi](https://github.com/earendil-works/pi) 1.4 or newer
-- [tmux](https://github.com/tmux/tmux)
+- [tmux](https://github.com/tmux/tmux) for TUI parents; not required for RPC parents
 - Optional: [dcg](https://github.com/Dicklesworthstone/destructive_command_guard)
 
 A clean `npm ci` from this repository's lockfile overrides `undici` to 8.12.3 (requires Node >=22.19). An existing mixed npm/pnpm `node_modules` may still resolve a different version: check `npm ls undici` and resolve it from the actual Pi package, or use a clean install. npm overrides are local to the installing root project; they do **not** patch a separately installed Pi host or a consuming project's dependency tree. Keep the host Pi and its dependencies updated independently.

@@ -18,6 +18,7 @@ import { Type } from "typebox";
 import { readFileSync } from "node:fs";
 import { writePrivateFile } from "./private-files.ts";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { STEERING_GENERATION_ENV, STEERING_SOCKET_ENV, startSteeringReceiver } from "./steering.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -207,9 +208,24 @@ export default function (pi: ExtensionAPI) {
   // lands — on `input` (covers a reply steered into the current run) and on
   // `agent_start` (covers a reply that starts a fresh turn after parking).
   let awaitingAnswer = false;
+  let steeringClose: (() => Promise<void>) | undefined;
+  let steeringStarting: Promise<void> | undefined;
+  async function stopSteeringReceiver() {
+    if (!steeringClose) await steeringStarting?.catch(() => {});
+    const close = steeringClose;
+    steeringClose = undefined;
+    steeringStarting = undefined;
+    await close?.();
+  }
 
   // Show widget + status bar on session start
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
+    const socketPath = process.env[STEERING_SOCKET_ENV];
+    const generation = process.env[STEERING_GENERATION_ENV];
+    if (socketPath && generation) {
+      steeringStarting = startSteeringReceiver(pi, socketPath, generation).then((close) => { steeringClose = close; });
+      await steeringStarting;
+    }
     recorder.sessionStart();
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
@@ -253,7 +269,7 @@ export default function (pi: ExtensionAPI) {
 
   let lastMessages: any[] | undefined;
   pi.on("agent_end", (event) => { lastMessages = event.messages; });
-  pi.on("agent_settled", (event, ctx) => {
+  pi.on("agent_settled", async (event, ctx) => {
     const childrenCount = runningChildrenCount(pi.getAllTools().some(tool =>
       tool.name === "subagent" || tool.name === "subagent_message",
     ));
@@ -272,6 +288,7 @@ export default function (pi: ExtensionAPI) {
       shouldAutoExitOnAgentEnd(userTookOver, messages);
 
     if (shouldExit) {
+      if (steeringStarting || steeringClose) await stopSteeringReceiver();
       if (writeLifecycle("settled")) {
         const rootRunId = process.env.PI_AUTONOMY_CHILD_ROOT_RUN_ID;
         const childId = process.env.PI_SUBAGENT_ID;
@@ -357,7 +374,8 @@ export default function (pi: ExtensionAPI) {
     recorder.toolExecutionEnd((event as any).toolCallId, (event as any).toolName);
   });
 
-  pi.on("session_shutdown", (event) => {
+  pi.on("session_shutdown", async (event) => {
+    if (steeringStarting || steeringClose) await stopSteeringReceiver();
     recorder.sessionShutdown((event as any).reason);
   });
 

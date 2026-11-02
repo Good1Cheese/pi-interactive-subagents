@@ -1,12 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync, chmodSync, statSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, chmodSync, statSync, mkdirSync, linkSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkCommand } from "../pi-extension/subagents/tools/dcg-guard.ts";
 import { pollForExit } from "../pi-extension/subagents/tmux.ts";
 import { seedSubagentSessionFile } from "../pi-extension/subagents/session.ts";
-import { ensurePrivateDir, writePrivateFile } from "../pi-extension/subagents/private-files.ts";
+import { appendPrivateFile, ensurePrivateDir, writePrivateFile } from "../pi-extension/subagents/private-files.ts";
 import subagentDone from "../pi-extension/subagents/subagent-done.ts";
 
 test("dcg permits, denies, and fails closed on technical errors", () => {
@@ -55,11 +55,37 @@ test("sensitive seeded sessions and questions tighten existing files under umask
     subagentDone({ on() {}, registerShortcut() {}, registerTool(tool: any) { tools.push(tool); } } as any);
     await tools.find((tool) => tool.name === "ask_question").execute("id", { question: "secret?" });
     assert.equal(statSync(`${child}.ask`).mode & 0o777, 0o600);
+    process.umask(0o777);
+    writePrivateFile(artifact, "owner-readable replacement");
+    assert.equal(statSync(artifact).mode & 0o777, 0o600);
   } finally {
     process.umask(oldMask);
     if (oldSession === undefined) delete process.env.PI_SUBAGENT_SESSION; else process.env.PI_SUBAGENT_SESSION = oldSession;
     if (oldActivity === undefined) delete process.env.PI_SUBAGENT_ACTIVITY_FILE; else process.env.PI_SUBAGENT_ACTIVITY_FILE = oldActivity;
     if (oldId === undefined) delete process.env.PI_SUBAGENT_ID; else process.env.PI_SUBAGENT_ID = oldId;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("artifact replacement isolates hardlink aliases and append rejects them", () => {
+  const dir = mkdtempSync(join(tmpdir(), "subagent-hardlink-"));
+  try {
+    const artifact = join(dir, "artifact");
+    const outsideAlias = join(dir, "outside");
+    writeFileSync(artifact, "outside data");
+    linkSync(artifact, outsideAlias);
+
+    writePrivateFile(artifact, "private replacement");
+    assert.equal(readFileSync(artifact, "utf8"), "private replacement");
+    assert.equal(readFileSync(outsideAlias, "utf8"), "outside data");
+
+    const appendTarget = join(dir, "append-target");
+    const appendAlias = join(dir, "append-alias");
+    writeFileSync(appendTarget, "shared session data");
+    linkSync(appendTarget, appendAlias);
+    assert.throws(() => appendPrivateFile(appendTarget, "\nnew entry"));
+    assert.equal(readFileSync(appendAlias, "utf8"), "shared session data");
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });

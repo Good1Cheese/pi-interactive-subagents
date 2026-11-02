@@ -3,9 +3,11 @@ import { keyHint, loadSkills, parseFrontmatter } from "@earendil-works/pi-coding
 import { Type, type Static } from "typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { dirname, join, resolve } from "node:path";
+import { launchRpcChild, type ExtensionUiRequest, type RpcChildHandle } from "./rpc-child.ts";
 import { fileURLToPath } from "node:url";
 import { randomInt, randomUUID } from "node:crypto";
 import { ensurePrivateDir, writePrivateFile } from "./private-files.ts";
+import { createSteeringEndpoint, sendSteeringMessage, STEERING_GENERATION_ENV, STEERING_SOCKET_ENV, type SteeringEndpoint } from "./steering.ts";
 import {
   readdirSync,
   readFileSync,
@@ -22,13 +24,14 @@ import {
   createSurface,
   configureTmuxSurfaces,
   tmuxSurfaceStatus,
-  sendCommand,
   sendLongCommand,
   pollForExit,
   closeSurface,
   isCleanSurfaceCompletion,
   shellEscape,
+  type PollResult,
   readScreen,
+  interpretExitSidecar,
 } from "./tmux.ts";
 
 import {
@@ -54,7 +57,6 @@ import {
   capStatusLines,
   classifyStatus,
   createStatusState,
-  forceStatusAfterInterrupt,
   formatStatusAggregate,
   formatTransitionLine,
   observeStatus,
@@ -78,6 +80,7 @@ const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
 const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
 const RELOAD_CHILDREN_KEY = Symbol.for("pi-subagents/reload-children");
+const NATIVE_CHILD_LIFECYCLE_KEY = Symbol.for("pi-subagents/native-child-lifecycle");
 
 {
   const prevInterval = (globalThis as any)[WIDGET_INTERVAL_KEY];
@@ -609,13 +612,11 @@ function resolveResultPresentation(
   const sessionRef = `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
 
   if (result.errorMessage) {
-    // Auto-retry exhausted or other agent-loop error. The subagent did not
-    // produce a usable result — surface the underlying provider/network
-    // failure so the orchestrator can decide whether to retry, resume, or
-    // change approach instead of silently treating the run as completed.
+    // The error may come from a provider, agent loop, or RPC protocol; keep
+    // the label neutral and surface the underlying cause.
     return (
       `Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)} ` +
-      `(provider/agent error — auto-retry exhausted).\n\n` +
+      `(error).\n\n` +
       `Error: ${result.errorMessage}\n\n` +
       `The subagent did not produce a result. You can retry by spawning a new ` +
       `subagent or resume the session with subagent_message.${sessionRef}`
@@ -655,7 +656,8 @@ interface RunningSubagent {
   name: string;
   task: string;
   agent?: string;
-  surface: string;
+  surface?: string;
+  rpc?: RpcChildHandle;
   startTime: number;
   sessionFile: string;
   launchScriptFile?: string;
@@ -682,6 +684,7 @@ interface RunningSubagent {
   nativeLifecycleFile?: string;
   nativeLifecycleSequence?: number;
   nativeLifecycleState?: "running" | "settled";
+  steering?: SteeringEndpoint;
 }
 
 type NativeChildLifecycle = {
@@ -692,7 +695,10 @@ type NativeChildLifecycle = {
   state: "started" | "settled" | "unknown";
   sequence?: number;
 };
-const nativeChildLifecycle = new Map<string, NativeChildLifecycle>();
+const nativeChildLifecycle =
+  ((globalThis as any)[NATIVE_CHILD_LIFECYCLE_KEY] as Map<string, NativeChildLifecycle> | undefined) ??
+  new Map<string, NativeChildLifecycle>();
+(globalThis as any)[NATIVE_CHILD_LIFECYCLE_KEY] = nativeChildLifecycle;
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
@@ -903,7 +909,7 @@ function applySandboxToParts(
 ): void {
   if (loadout.model) {
     const model = loadout.thinking ? `${loadout.model}:${loadout.thinking}` : loadout.model;
-    parts.push("--model", shellEscape(model));
+    parts.push("--model", model);
   }
 
   if (loadout.identity) {
@@ -919,7 +925,7 @@ function applySandboxToParts(
     ensurePrivateDir(opts.artifactDir);
     ensurePrivateDir(dirname(spPath));
     writePrivateFile(spPath, loadout.identity);
-    parts.push(flag, shellEscape(spPath));
+    parts.push(flag, spPath);
   }
 
   // Default-deny: disable global extension discovery and re-enable only the
@@ -927,17 +933,17 @@ function applySandboxToParts(
   // was intentionally unrestricted (e.g. a fork clone) and is replayed as-is.
   if (loadout.toolAllowlist) {
     parts.push("--no-extensions");
-    parts.push("--tools", shellEscape(loadout.toolAllowlist));
+    parts.push("--tools", loadout.toolAllowlist);
 
     const extPaths = loadout.toolExtensions ?? loadout.toolAllowlist.split(",").map(getToolExtensionPath).filter((p): p is string => !!p && existsSync(p));
     for (const extPath of new Set(extPaths)) {
       if (!existsSync(extPath)) throw new Error(`Tool extension missing: ${extPath}`);
-      parts.push("-e", shellEscape(extPath));
+      parts.push("-e", extPath);
     }
   }
   for (const extPath of loadout.extensionAllowlist ?? []) {
     if (!existsSync(extPath)) throw new Error(`Configured child extension missing: ${extPath}`);
-    parts.push("-e", shellEscape(extPath));
+    parts.push("-e", extPath);
   }
 }
 
@@ -945,10 +951,35 @@ function buildPiPromptArgs(params: {
   effectiveSkills?: string;
   taskDelivery: "direct" | "artifact";
   taskArg: string;
+  mode?: "tui" | "rpc";
 }): string[] {
-  // Skills are embedded in the task before this point. Multiple positional
-  // prompts start separate runs and auto-exit can stop before the real task.
-  return [params.taskArg];
+  // RPC receives this prompt through the protocol, not as a second positional message.
+  return params.mode === "rpc" ? [] : [params.taskArg];
+}
+
+async function forwardRpcUiRequest(request: ExtensionUiRequest) {
+  const ui = latestCtx?.ui;
+  if (!ui || !latestCtx?.hasUI) return { cancelled: true };
+  const title = typeof request.title === "string" ? request.title : "";
+  switch (request.method) {
+    case "select": {
+      if (!Array.isArray(request.options) || !request.options.every((item) => typeof item === "string")) return { cancelled: true };
+      const value = await ui.select(title, request.options as string[]);
+      return value === undefined ? { cancelled: true } : { value };
+    }
+    case "input": {
+      const value = await ui.input(title, typeof request.placeholder === "string" ? request.placeholder : undefined);
+      return value === undefined ? { cancelled: true } : { value };
+    }
+    case "confirm":
+      return { confirmed: await ui.confirm(title, typeof request.message === "string" ? request.message : "") };
+    case "editor": {
+      const value = await ui.editor(title, typeof request.prefill === "string" ? request.prefill : undefined);
+      return value === undefined ? { cancelled: true } : { value };
+    }
+    default:
+      return { cancelled: true };
+  }
 }
 
 function activityLabel(activity: SubagentActivityState): string | undefined {
@@ -1118,32 +1149,24 @@ function resolveRunningByName(name: string):
   return { error: `Ambiguous subagent name "${requestedName}". Matches: ${candidates}` };
 }
 
-/**
- * Type a follow-up message into a running subagent's live pane. Newlines are
- * collapsed to spaces because each newline submits a turn in the child's TUI
- * editor; a multi-line message would otherwise fire as several partial turns.
- */
-function steerSubagent(
-  running: RunningSubagent,
-  message: string,
-  send: (surface: string, command: string) => void = sendCommand,
-): { ok: true } | { error: string } {
-  const flattened = message.replace(/\s*\n\s*/g, " ").trim();
-  try {
-    send(running.surface, flattened);
-    return { ok: true };
-  } catch (error: any) {
-    return {
-      error:
-        `Failed to deliver message to subagent "${running.name}" via tmux: ` +
-        `${error?.message ?? String(error)}`,
-    };
+/** Address the child's launch generation, never its terminal or shell. */
+async function steerSubagent(running: RunningSubagent, message: string): Promise<{ ok: true } | { error: string }> {
+  if (running.rpc) {
+    const status = await running.rpc.steer(message);
+    return status === "accepted"
+      ? { ok: true as const }
+      : { error: `RPC steering ${status} for subagent "${running.name}"; message was not retried.` };
   }
+  if (!running.steering)
+    return { error: `Subagent "${running.name}" has no safe steering endpoint; start a fresh generation.` };
+  const status = await sendSteeringMessage(running.steering.socketPath, running.steering.generation, message);
+  return status === "accepted"
+    ? { ok: true as const }
+    : { error: `Steering ${status} for subagent "${running.name}"; message was not retried.` };
 }
 
-function handleSubagentSteer(
+async function handleSubagentSteer(
   params: { name?: string; message?: string },
-  send: (surface: string, command: string) => void = sendCommand,
 ) {
   const message = params.message?.trim();
   if (!message) {
@@ -1163,7 +1186,7 @@ function handleSubagentSteer(
   const now = Date.now();
   observeRunningSubagent(running, now);
 
-  const steer = steerSubagent(running, message, send);
+  const steer = await steerSubagent(running, message);
   if ("error" in steer) {
     return {
       content: [{ type: "text" as const, text: steer.error }],
@@ -1171,15 +1194,14 @@ function handleSubagentSteer(
     };
   }
 
-  running.statusState = forceStatusAfterInterrupt(running.statusState, now);
   updateWidget();
 
   return {
     content: [{
       type: "text" as const,
       text:
-        `Message delivered to running subagent "${running.name}". It picks this up at its next ` +
-        `turn boundary. If it exits, its result still arrives as a steer message.`,
+        `Message accepted into Pi's queue for subagent "${running.name}". ` +
+        `Consumption and application are not confirmed.`,
     }],
     details: { id: running.id, name: running.name, status: "steered" },
   };
@@ -1299,7 +1321,7 @@ function startWidgetRefresh() {
  */
 async function launchSubagent(
   params: Static<typeof SubagentParams> & { name: string },
-  ctx: { sessionManager: { getSessionFile(): string | null | undefined; getSessionId(): string; getSessionDir(): string }; cwd: string; model?: { provider: string; id: string } },
+  ctx: { sessionManager: { getSessionFile(): string | null | undefined; getSessionId(): string; getSessionDir(): string }; cwd: string; mode?: string; model?: { provider: string; id: string } },
   options: { surface?: string; signal: AbortSignal },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
@@ -1371,13 +1393,15 @@ async function launchSubagent(
     });
   }
 
-  // Use pre-created surface (parallel mode) or create a new one only after native admission.
-  // For new surfaces, pause briefly so the shell is ready before sending the command.
-  const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
+  // RPC children are real Pi processes and must never depend on a terminal surface.
+  const rpcMode = ctx.mode === "rpc";
+  const surface = rpcMode ? undefined : options?.surface ?? createSurface(params.name);
+  let steering: SteeringEndpoint | undefined;
+  let rpc: RpcChildHandle | undefined;
   try {
-  if (!surfacePreCreated) await waitForShell(options.signal);
+  if (surface && !options?.surface) await waitForShell(options.signal);
   options.signal.throwIfAborted();
+  if (!rpcMode) steering = createSteeringEndpoint();
   const nativeLaunchEnv = nativeLaunchRequest.provided
     ? { ...nativeLaunchRequest.env, PI_SUBAGENT_ROOT_STATE_FILE: nativeLaunchRequest.rootStateFile }
     : nativeLaunchRequest.env;
@@ -1438,7 +1462,7 @@ async function launchSubagent(
     cmdParts.push(shellEscape(params.task));
 
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = `unset ${"${!PI_SUBAGENT_@}"} ${"${!PI_AUTONOMY_CHILD_@}"}; ${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
 
     const launchScriptName = `${(params.name || "subagent")
       .toLowerCase()
@@ -1448,6 +1472,7 @@ async function launchSubagent(
       .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
+    if (!surface) throw new Error("Claude launch requires a TUI surface");
     sendLongCommand(surface, command, {
       scriptPath: launchScriptFile,
       scriptPreamble: "# Claude Code subagent launch script",
@@ -1479,11 +1504,11 @@ async function launchSubagent(
   // ── Pi CLI path ──
 
   // Build pi command
-  const parts: string[] = ["pi"];
-  parts.push("--session", shellEscape(subagentSessionFile));
+  const parts: string[] = [];
+  parts.push("--session", subagentSessionFile);
 
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-  parts.push("-e", shellEscape(subagentDonePath));
+  parts.push("-e", subagentDonePath);
 
   // Resolve the config dir the child sees: a target-local .pi/agent/ wins,
   // else the propagated global dir. Captured once so the launch env and the
@@ -1523,40 +1548,44 @@ async function launchSubagent(
   // the shared helper (same code path resume uses — they can't drift).
   applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
   // Last tool_call handler sees input after configured extension transformers.
-  parts.push("-e", shellEscape(join(SUBAGENTS_DIR, "tools", "dcg-guard.ts")));
+  parts.push("-e", join(SUBAGENTS_DIR, "tools", "dcg-guard.ts"));
 
   // Build env prefix: subagent identity + config dir propagation + spawn allowlist
-  const envParts: string[] = [];
+  const childEnv: Record<string, string> = {};
 
   if (resolvedAgentDir) {
-    envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)}`);
+    childEnv.PI_CODING_AGENT_DIR = resolvedAgentDir;
   }
 
   if (grantSpawning && agentDefs?.subagentAgents) {
-    envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
+    childEnv.PI_SUBAGENT_ALLOWED = agentDefs.subagentAgents.join(",");
   }
-  envParts.push(`PI_SUBAGENT_TOOL_ALLOWLIST=${shellEscape(toolAllowlist)}`);
-  envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
+  childEnv.PI_SUBAGENT_TOOL_ALLOWLIST = toolAllowlist;
+  childEnv.PI_SUBAGENT_NAME = params.name;
   if (params.agent) {
-    envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
+    childEnv.PI_SUBAGENT_AGENT = params.agent;
   }
   if (agentDefs?.autoExit) {
-    envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
+    childEnv.PI_SUBAGENT_AUTO_EXIT = "1";
   }
-  envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
-  envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
-  envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
+  childEnv.PI_SUBAGENT_SESSION = subagentSessionFile;
+  childEnv.PI_SUBAGENT_ID = id;
+  childEnv.PI_SUBAGENT_ACTIVITY_FILE = activityFile;
   if (nativeLaunchRequest.provided)
-    envParts.push(`PI_SUBAGENT_LIFECYCLE_FILE=${shellEscape(`${subagentSessionFile}.native-lifecycle`)}`);
-  envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
+    childEnv.PI_SUBAGENT_LIFECYCLE_FILE = `${subagentSessionFile}.native-lifecycle`;
+  if (surface) childEnv.PI_SUBAGENT_SURFACE = surface;
   if (nativeLaunchRequest.provided) {
     for (const [key, value] of Object.entries(nativeLaunchEnv)) {
       if (!/^[A-Z_][A-Z0-9_]*$/.test(key) || typeof value !== "string")
         throw new Error(`Invalid native launch environment key: ${key}`);
-      envParts.push(`${key}=${shellEscape(value)}`);
+      childEnv[key] = value;
     }
   }
-  const envPrefix = envParts.join(" ") + " ";
+  if (steering) {
+    childEnv[STEERING_SOCKET_ENV] = steering.socketPath;
+    childEnv[STEERING_GENERATION_ENV] = steering.generation;
+  }
+  const envPrefix = Object.entries(childEnv).map(([key, value]) => `${key}=${shellEscape(value)}`).join(" ") + " ";
 
   // Pass task and skill prompts to the sub-agent.
   // Only full-context fork mode gets a direct task argument because it already
@@ -1565,57 +1594,63 @@ async function launchSubagent(
   let taskArg: string;
   if (launchBehavior.taskDelivery === "direct") {
     taskArg = fullTask;
+  } else if (rpcMode) {
+    taskArg = "";
   } else {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     const safeName = params.name
       .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "") // strip everything except alphanumeric, spaces, hyphens
-      .replace(/\s+/g, "-") // spaces to hyphens
-      .replace(/-+/g, "-") // collapse multiple hyphens
-      .replace(/^-|-$/g, ""); // trim leading/trailing hyphens
-    const artifactName = `context/${safeName || "subagent"}-${timestamp}-${id}.md`;
-    const artifactPath = join(artifactDir, artifactName);
+      .replace(/[^a-z0-9\s-]/g, "")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "");
+    const artifactPath = join(artifactDir, `context/${safeName || "subagent"}-${timestamp}-${id}.md`);
     ensurePrivateDir(dirname(artifactPath));
     writePrivateFile(artifactPath, fullTask);
     taskArg = `@${artifactPath}`;
   }
 
-  for (const promptArg of buildPiPromptArgs({
+  parts.push(...buildPiPromptArgs({
     effectiveSkills,
     taskDelivery: launchBehavior.taskDelivery,
     taskArg,
-  })) {
-    parts.push(shellEscape(promptArg));
-  }
+    mode: rpcMode ? "rpc" : "tui",
+  }));
 
   // Resolve cwd — param overrides agent default, supports absolute and relative paths.
   // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
-  const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-
-  const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
-  const launchScriptName = `${(params.name || "subagent")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, "")
-    .replace(/\s+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
-  const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-  sendLongCommand(surface, command, {
-    scriptPath: launchScriptFile,
-    scriptPreamble: "# Subagent launch script",
-  });
+  let launchScriptFile: string | undefined;
+  if (rpcMode) {
+    const baseEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+      !key.startsWith("PI_SUBAGENT_") && !key.startsWith("PI_AUTONOMY_CHILD_"),
+    )) as Record<string, string>;
+    rpc = launchRpcChild({ args: parts, cwd: effectiveCwd ?? ctx.cwd, env: { ...baseEnv, ...childEnv }, initialMessage: fullTask });
+  } else {
+    if (!surface) throw new Error("TUI launch surface was not created");
+    const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
+    const command = `unset ${"${!PI_SUBAGENT_@}"} ${"${!PI_AUTONOMY_CHILD_@}"}; ${cdPrefix}${envPrefix}pi ${parts.map(shellEscape).join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const launchScriptName = `${(params.name || "subagent")
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, "")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
+    launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
+    sendLongCommand(surface, command, { scriptPath: launchScriptFile, scriptPreamble: "# Subagent launch script" });
+  }
 
   const running: RunningSubagent = {
     id,
     name: params.name,
     task: params.task,
     agent: params.agent,
-    surface,
+    ...(surface ? { surface } : {}),
+    ...(rpc ? { rpc } : {}),
     startTime,
     sessionFile: subagentSessionFile,
-    launchScriptFile,
+    ...(launchScriptFile ? { launchScriptFile } : {}),
     activityFile,
+    steering,
     interactive: effectiveInteractive,
     ...(nativeLaunchRequest.provided ? {
       nativeRootSessionId: sessionId,
@@ -1628,6 +1663,10 @@ async function launchSubagent(
     }),
   };
 
+  if (rpc) {
+    rpc.onActivity = () => { observeRunningSubagent(running); deliverPendingQuestion(running); updateWidget(); };
+    rpc.onUiRequest = forwardRpcUiRequest;
+  }
   registerName(artifactDir, running.name, { sessionFile: running.sessionFile, sessionId: getSessionId(running.sessionFile) });
   runningSubagents.set(id, running);
   if (nativeLaunchRequest.provided) {
@@ -1640,7 +1679,9 @@ async function launchSubagent(
       nativeChildLifecycle.set(id, { rootSessionId: sessionId, rootRunId: nativeLaunchRequest.rootRunId, childId: id, childSessionFile: subagentSessionFile, state: "unknown" });
       latestPi?.events.emit("pi-interactive-subagents:child-lifecycle", { rootSessionId: sessionId, rootRunId: nativeLaunchRequest.rootRunId, childId: id, childSessionFile: subagentSessionFile, state: "unknown" });
     }
-    try { closeSurface(surface); } catch {}
+    if (rpc) await rpc.close();
+    if (surface) { try { closeSurface(surface); } catch {} }
+    try { steering?.dispose(); } catch {}
     throw error;
   }
 }
@@ -1680,24 +1721,23 @@ function copyClaudeSession(sentinelFile: string): string | null {
  */
 function deliverPendingQuestion(running: RunningSubagent): void {
   const askFile = `${running.sessionFile}.ask`;
-  let payload: any = null;
+  let payload: any;
   try {
     if (!existsSync(askFile)) return;
     payload = JSON.parse(readFileSync(askFile, "utf-8"));
   } catch {
-    // Malformed/partway-written file — drop it and move on.
+    // Keep malformed/partway-written files for a later retry.
+    return;
   }
-  try {
-    unlinkSync(askFile);
-  } catch {}
-  if (!payload?.question) return;
+  if (typeof payload?.question !== "string" || !payload.question.trim() || !latestPi) return;
 
   const name = running.name; // unique per session (deduped at spawn) — targets the reply
   const sessionId = existsSync(running.sessionFile) ? getSessionId(running.sessionFile) : null;
   const elapsed = Math.floor((Date.now() - running.startTime) / 1000);
   const replyHint = `\n\nReply with subagent_message({ name: "${name}", message: "…" }) — the same name works whether it is still running or has since exited. It stays open until you reply.`;
 
-  latestPi?.sendMessage(
+  try {
+    latestPi.sendMessage(
     {
       customType: "subagent_question",
       content: `Sub-agent "${name}" asks (${formatElapsed(elapsed)}):\n\n${payload.question}${replyHint}`,
@@ -1710,7 +1750,11 @@ function deliverPendingQuestion(running: RunningSubagent): void {
       },
     },
     { triggerTurn: true, deliverAs: "steer" },
-  );
+    );
+  } catch {
+    return;
+  }
+  try { unlinkSync(askFile); } catch {}
 }
 
 async function watchSubagent(
@@ -1720,17 +1764,39 @@ async function watchSubagent(
   const { name, task, surface, startTime, sessionFile } = running;
 
   try {
-    const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
-      interval: 1000,
-      sessionFile,
-      sentinelFile: running.sentinelFile,
-      onTick() {
-        observeRunningSubagent(running);
-        deliverPendingQuestion(running);
-      },
-    });
+    let result: PollResult | { exitCode: number; errorMessage?: string };
+    if (running.rpc) {
+      const abortSignal = AbortSignal.any([signal, getModuleAbortSignal()]);
+      result = await Promise.race([
+        running.rpc.finished,
+        new Promise<never>((_resolve, reject) => {
+          if (abortSignal.aborted) reject(abortSignal.reason);
+          else abortSignal.addEventListener("abort", () => reject(abortSignal.reason), { once: true });
+        }),
+      ]);
+    } else {
+      if (!surface) throw new Error("Subagent has neither an RPC handle nor a TUI surface");
+      result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
+        interval: 1000,
+        sessionFile,
+        sentinelFile: running.sentinelFile,
+        onTick() {
+          observeRunningSubagent(running);
+          deliverPendingQuestion(running);
+        },
+      });
+    }
 
     signal.throwIfAborted();
+    if (running.rpc && existsSync(`${sessionFile}.exit`)) {
+      try {
+        const sidecar = JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8"));
+        const interpreted = interpretExitSidecar(sidecar);
+        if (interpreted.errorMessage && !result.errorMessage)
+          result = { ...result, exitCode: interpreted.exitCode, errorMessage: interpreted.errorMessage };
+        unlinkSync(`${sessionFile}.exit`);
+      } catch {}
+    }
     observeNativeChildLifecycle(running);
     emitNativeChildLifecycle(running, "process_closed");
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
@@ -1745,7 +1811,7 @@ async function watchSubagent(
         } catch {}
       }
 
-      if (!summary) {
+      if (!summary && surface) {
         summary = readScreen(surface, 200)
           .replace(/__SUBAGENT_DONE_\d+__/, "")
           .trimEnd();
@@ -1765,7 +1831,8 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      closeSurface(surface, { completed: isCleanSurfaceCompletion(result) });
+      if (surface && "reason" in result) closeSurface(surface, { completed: isCleanSurfaceCompletion(result) });
+      try { running.steering?.dispose(); } catch {}
       runningSubagents.delete(running.id);
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
@@ -1793,7 +1860,8 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    try { closeSurface(surface, { completed: isCleanSurfaceCompletion(result) }); } catch { /* pane may already be gone */ }
+    if (surface && "reason" in result) { try { closeSurface(surface, { completed: isCleanSurfaceCompletion(result) }); } catch { /* pane may already be gone */ } }
+    try { running.steering?.dispose(); } catch {}
     runningSubagents.delete(running.id);
 
     return {
@@ -1811,9 +1879,10 @@ async function watchSubagent(
     if (signal.reason === "reload-transfer") {
       return { name, task, summary: "", exitCode: 1, elapsed: 0, error: "reload-transfer", sessionFile };
     }
-    try {
-      closeSurface(surface);
-    } catch {}
+    emitNativeChildLifecycle(running, "unknown");
+    if (running.rpc && signal.reason !== "reload-transfer") await running.rpc.close();
+    if (surface) { try { closeSurface(surface); } catch {} }
+    try { running.steering?.dispose(); } catch {}
     runningSubagents.delete(running.id);
 
     if (signal.aborted) {
@@ -1875,13 +1944,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (event.reason === "reload" && transferred) {
       for (const running of transferred) {
         runningSubagents.set(running.id, running);
+        if (running.rpc) {
+          running.rpc.onActivity = () => { observeRunningSubagent(running); deliverPendingQuestion(running); updateWidget(); };
+          running.rpc.onUiRequest = forwardRpcUiRequest;
+        }
         const abort = new AbortController();
         running.abortController = abort;
         watchSubagent(running, abort.signal).then((result) => {
           if (abort.signal.aborted || result.error === "reload-transfer") return;
           updateWidget();
           pi.sendMessage({ customType: "subagent_result", content: resolveResultPresentation(result, running.name), display: true,
-            details: { name: running.name, task: running.task, agent: running.agent, exitCode: result.exitCode, elapsed: result.elapsed, sessionFile: result.sessionFile } },
+            details: { name: running.name, task: running.task, agent: running.agent, exitCode: result.exitCode, elapsed: result.elapsed, sessionFile: result.sessionFile, ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}) } },
             { triggerTurn: true, deliverAs: "steer" });
         });
       }
@@ -1893,7 +1966,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   pi.on("session_before_fork", () => hasOwnedWork() ? { cancel: true } : undefined);
 
   // Clean up on session shutdown
-  pi.on("session_shutdown", (event, _ctx) => {
+  pi.on("session_shutdown", async (event, _ctx) => {
     lifecycleAbort.abort(new Error("Session shutdown during subagent launch"));
     if (widgetInterval) {
       clearInterval(widgetInterval);
@@ -1909,6 +1982,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     for (const [_id, agent] of runningSubagents) {
       agent.abortController?.abort(event.reason === "reload" ? "reload-transfer" : undefined);
     }
+    if (event.reason !== "reload") await Promise.all([...runningSubagents.values()].map((agent) => agent.rpc?.close()));
     const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
     if (moduleAbort) moduleAbort.abort();
     runningSubagents.clear();
@@ -1997,9 +2071,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Validate prerequisites (need mux + a session file to derive the
-        // artifact dir that hosts this session's name registry).
-        if (!isMuxAvailable()) {
+        // TUI needs a mux; RPC launches a real headless Pi child instead.
+        if (ctx.mode !== "rpc" && !isMuxAvailable()) {
           return muxUnavailableResult();
         }
 
@@ -2318,7 +2391,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
-        if (!isMuxAvailable()) {
+        if (ctx.mode !== "rpc" && !isMuxAvailable()) {
           return muxUnavailableResult();
         }
 
@@ -2439,19 +2512,25 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         reservedSessions.add(canonicalSessionPath);
         const resumeSignal = lifecycleAbort.signal;
+        const rpcMode = ctx.mode === "rpc";
         let surface: string | undefined;
+        let steering: SteeringEndpoint | undefined;
+        let rpc: RpcChildHandle | undefined;
         let running: RunningSubagent;
         try {
-        surface = createSurface(name);
-        await waitForShell(resumeSignal);
-        resumeSignal.throwIfAborted();
+        if (!rpcMode) {
+          surface = createSurface(name);
+          await waitForShell(resumeSignal);
+          resumeSignal.throwIfAborted();
+          steering = createSteeringEndpoint();
+        }
 
-        // Build pi resume command
-        const parts = ["pi", "--session", shellEscape(sessionPath)];
+        // Build raw Pi argv; the TUI path serializes it only at tmux's shell boundary.
+        const parts = ["--session", sessionPath];
 
         // Load subagent-done extension so the agent can self-terminate if needed
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-        parts.push("-e", shellEscape(subagentDonePath));
+        parts.push("-e", subagentDonePath);
 
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
@@ -2461,7 +2540,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Replay the model, identity, and default-deny tool/extension sandbox.
         applySandboxToParts(parts, loadout, { artifactDir, name });
-        parts.push("-e", shellEscape(join(SUBAGENTS_DIR, "tools", "dcg-guard.ts")));
+        parts.push("-e", join(SUBAGENTS_DIR, "tools", "dcg-guard.ts"));
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
@@ -2476,71 +2555,85 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               .replace(/-+/g, "-")
               .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}-${id}.md`,
           );
-          ensurePrivateDir(dirname(resumeMsgFile));
-          writePrivateFile(resumeMsgFile, message);
-          parts.push(shellEscape(`@${resumeMsgFile}`));
+          if (!rpcMode) {
+            ensurePrivateDir(dirname(resumeMsgFile));
+            writePrivateFile(resumeMsgFile, message);
+            parts.push(`@${resumeMsgFile}`);
+          }
         }
 
         // Build env prefix — replay the snapshot's config dir + spawn whitelist
         // so the resumed process resolves the same agents/extensions and keeps
         // the same nested-spawn restriction it originally ran with.
-        const resumeEnvParts: string[] = [];
+        const resumeEnv: Record<string, string> = {};
         const resumeAgentDir = loadout.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? null;
         if (resumeAgentDir) {
-          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resumeAgentDir)}`);
+          resumeEnv.PI_CODING_AGENT_DIR = resumeAgentDir;
         }
         if (loadout.spawnable && loadout.spawnable.length > 0) {
-          resumeEnvParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(loadout.spawnable.join(","))}`);
+          resumeEnv.PI_SUBAGENT_ALLOWED = loadout.spawnable.join(",");
         }
         if (loadout.agent) {
-          resumeEnvParts.push(`PI_SUBAGENT_AGENT=${shellEscape(loadout.agent)}`);
+          resumeEnv.PI_SUBAGENT_AGENT = loadout.agent;
         }
-        resumeEnvParts.push(`PI_SUBAGENT_TOOL_ALLOWLIST=${shellEscape(loadout.toolAllowlist ?? "read,write,edit,bash")}`);
-        resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(sessionPath)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
+        resumeEnv.PI_SUBAGENT_TOOL_ALLOWLIST = loadout.toolAllowlist ?? "read,write,edit,bash";
+        resumeEnv.PI_SUBAGENT_NAME = name;
+        resumeEnv.PI_SUBAGENT_SESSION = sessionPath;
+        resumeEnv.PI_SUBAGENT_ID = id;
+        resumeEnv.PI_SUBAGENT_ACTIVITY_FILE = activityFile;
         if (loadout.launchEnv?.PI_AUTONOMY_CHILD_ROOT_RUN_ID)
-          resumeEnvParts.push(`PI_SUBAGENT_LIFECYCLE_FILE=${shellEscape(`${sessionPath}.native-lifecycle`)}`);
+          resumeEnv.PI_SUBAGENT_LIFECYCLE_FILE = `${sessionPath}.native-lifecycle`;
         if (autoExit) {
-          resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
+          resumeEnv.PI_SUBAGENT_AUTO_EXIT = "1";
         }
         for (const [key, value] of Object.entries(loadout.launchEnv ?? {})) {
           if (/^[A-Z_][A-Z0-9_]*$/.test(key) && typeof value === "string")
-            resumeEnvParts.push(`${key}=${shellEscape(value)}`);
+            resumeEnv[key] = value;
         }
-        const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
+        if (steering) {
+          resumeEnv[STEERING_SOCKET_ENV] = steering.socketPath;
+          resumeEnv[STEERING_GENERATION_ENV] = steering.generation;
+        }
+        const resumeEnvPrefix = Object.entries(resumeEnv).map(([key, value]) => `${key}=${shellEscape(value)}`).join(" ") + " ";
 
         // Resume in the subagent's original cwd so its tools (safe_bash, edits)
         // operate where they did before.
         const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
 
-        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
-        const launchScriptFile = join(
-          artifactDir,
-          "subagent-scripts",
-          `${name
-            .toLowerCase()
-            .replace(/[^a-z0-9\s-]/g, "")
-            .replace(/\s+/g, "-")
-            .replace(/-+/g, "-")
-            .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
-        );
-        sendLongCommand(surface, command, {
-          scriptPath: launchScriptFile,
-          scriptPreamble: "# Subagent resume script",
-        });
+        const command = `unset ${"${!PI_SUBAGENT_@}"} ${"${!PI_AUTONOMY_CHILD_@}"}; ${resumeCdPrefix}${resumeEnvPrefix}pi ${parts.map(shellEscape).join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        let launchScriptFile: string | undefined;
+        if (rpcMode) {
+          const baseEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+            !key.startsWith("PI_SUBAGENT_") && !key.startsWith("PI_AUTONOMY_CHILD_"),
+          )) as Record<string, string>;
+          rpc = launchRpcChild({ args: parts, cwd: loadout.cwd ?? ctx.cwd, env: { ...baseEnv, ...resumeEnv }, initialMessage: message });
+        } else {
+          if (!surface) throw new Error("TUI resume surface was not created");
+          launchScriptFile = join(
+            artifactDir,
+            "subagent-scripts",
+            `${name
+              .toLowerCase()
+              .replace(/[^a-z0-9\s-]/g, "")
+              .replace(/\s+/g, "-")
+              .replace(/-+/g, "-")
+              .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
+          );
+          sendLongCommand(surface, command, { scriptPath: launchScriptFile, scriptPreamble: "# Subagent resume script" });
+        }
 
         // Register as a running subagent for widget tracking
         running = {
           id,
           name,
           task: message,
-          surface,
+          ...(surface ? { surface } : {}),
+          ...(rpc ? { rpc } : {}),
           startTime,
           sessionFile: sessionPath,
-          launchScriptFile,
+          ...(launchScriptFile ? { launchScriptFile } : {}),
           activityFile,
+          steering,
           interactive,
           ...(loadout.launchEnv?.PI_AUTONOMY_CHILD_ROOT_RUN_ID ? {
             nativeRootSessionId: sessionId,
@@ -2552,6 +2645,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             startTimeMs: startTime,
           }),
         };
+        if (rpc) {
+          rpc.onActivity = () => { observeRunningSubagent(running); deliverPendingQuestion(running); updateWidget(); };
+          rpc.onUiRequest = forwardRpcUiRequest;
+        }
         runningSubagents.set(id, running);
         if (running.nativeRootRunId) {
           nativeChildLifecycle.set(id, { rootSessionId: sessionId, rootRunId: running.nativeRootRunId, childId: id, childSessionFile: sessionPath, state: "started" });
@@ -2563,7 +2660,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             nativeChildLifecycle.set(id, { rootSessionId: ctx.sessionManager.getSessionId(), rootRunId, childId: id, childSessionFile: sessionPath, state: "unknown" });
             latestPi?.events.emit("pi-interactive-subagents:child-lifecycle", { rootSessionId: ctx.sessionManager.getSessionId(), rootRunId, childId: id, childSessionFile: sessionPath, state: "unknown" });
           }
+          if (rpc) await rpc.close();
           if (surface) { try { closeSurface(surface); } catch {} }
+          try { steering?.dispose(); } catch {}
           throw error;
         } finally {
           reservedSessions.delete(canonicalSessionPath);

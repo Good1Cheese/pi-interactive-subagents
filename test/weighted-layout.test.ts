@@ -69,6 +69,12 @@ describe("weighted tmux layout", () => {
   it("fills the entire height and width with a slightly larger orchestrator after any agent count", () => {
     for (let n = 1; n <= 12; n++) verifyNoUnusedSpace(170, 45, n);
   });
+  it("keeps the orchestrator larger when the configured weight is neutral", () => {
+    const result = createWeightedLayout(40, 15, 4, 1)!;
+    const areas = result.panes.map(r => r.width * r.height);
+    assert.ok(areas[0] > Math.max(...areas.slice(1)), `orchestrator should exceed every worker: ${areas}`);
+  });
+
   it("respects user-specified main weight", () => {
     const small = createWeightedLayout(170, 45, 4, 1.05)!;
     const large = createWeightedLayout(170, 45, 4, 1.7)!;
