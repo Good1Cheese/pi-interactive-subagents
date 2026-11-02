@@ -115,6 +115,8 @@ export interface SubagentLoadout {
   cwd: string | null;
   /** PI_CODING_AGENT_DIR the subagent resolved config/extensions from, or null. */
   agentDir: string | null;
+  /** Explicit non-secret launch environment from trusted extension hooks; replayed verbatim. */
+  launchEnv?: Record<string, string>;
 }
 
 /** Path of the loadout sidecar written next to a subagent session file. */

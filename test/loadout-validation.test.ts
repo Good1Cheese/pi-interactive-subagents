@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
+import { createEventBus } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/event-bus.js";
 import { readSubagentLoadout } from "../pi-extension/subagents/session.ts";
 
 test("an explicitly empty inherited spawn allowlist never becomes unrestricted", () => {
@@ -40,7 +41,12 @@ test("spawn and resume preserve YAML tool arrays and the absent-tools default", 
     const mod = await import("../pi-extension/subagents/index.ts");
     const handlers = new Map<string, Function>();
     const tools = new Map<string, any>();
-    const pi: any = { on: (name: string, fn: Function) => handlers.set(name, fn), registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {} };
+    const pi: any = {
+      events: createEventBus(),
+      on: (name: string, fn: Function) => handlers.set(name, fn),
+      registerTool: (tool: any) => tools.set(tool.name, tool),
+      registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {},
+    };
     mod.default(pi);
     const parent = join(root, "parent.jsonl"); writeFileSync(parent, '{"type":"session","id":"parent"}\n');
     const ctx = { cwd: root, hasUI: false, sessionManager: { getSessionFile: () => parent, getSessionId: () => "parent", getSessionDir: () => root } };

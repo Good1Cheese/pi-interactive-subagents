@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createEventBus } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/event-bus.js";
 import { pollForExit } from "../pi-extension/subagents/tmux.ts";
 import { registerName, writeSubagentLoadout } from "../pi-extension/subagents/session.ts";
 
@@ -51,7 +52,12 @@ test("delayed launch and resume block switch/fork and reload closes pending pane
     const mod = await import("../pi-extension/subagents/index.ts");
     const handlers = new Map<string, Function>();
     const tools = new Map<string, any>();
-    const pi: any = { on: (name: string, fn: Function) => handlers.set(name, fn), registerTool: (t: any) => tools.set(t.name, t), registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {} };
+    const pi: any = {
+      events: createEventBus(),
+      on: (name: string, fn: Function) => handlers.set(name, fn),
+      registerTool: (t: any) => tools.set(t.name, t),
+      registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {},
+    };
     mod.default(pi);
     const parent = join(root, "parent.jsonl"); writeFileSync(parent, '{"type":"session","id":"parent"}\n');
     const ctx = { cwd: root, sessionManager: { getSessionFile: () => parent, getSessionId: () => "parent", getSessionDir: () => root } };

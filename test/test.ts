@@ -89,6 +89,18 @@ function createMockExtensionApi() {
   const registeredMessageRenderers: Array<any> = [];
   const sentUserMessages: string[] = [];
   const sentMessages: Array<any> = [];
+  const eventHandlers = new Map<string, Set<(data: unknown) => void>>();
+  const events = {
+    on(channel: string, handler: (data: unknown) => void) {
+      const handlers = eventHandlers.get(channel) ?? new Set();
+      handlers.add(handler);
+      eventHandlers.set(channel, handlers);
+      return () => handlers.delete(handler);
+    },
+    emit(channel: string, data: unknown) {
+      for (const handler of eventHandlers.get(channel) ?? []) handler(data);
+    },
+  };
   return {
     registeredTools,
     registeredCommands,
@@ -96,6 +108,7 @@ function createMockExtensionApi() {
     sentUserMessages,
     sentMessages,
     api: {
+      events,
       on() {},
       registerTool(tool: any) {
         registeredTools.push(tool);
@@ -1719,9 +1732,9 @@ describe("subagent-done.ts", () => {
       }
     }
 
-    it("returns 0 when the spawning tools aren't loaded (no global)", () => {
+    it("returns unknown when the spawning tools aren't loaded (no global)", () => {
       withGlobal(undefined, () => {
-        assert.equal(runningChildrenCount(), 0);
+        assert.equal(runningChildrenCount(), undefined);
       });
     });
 
@@ -1731,11 +1744,12 @@ describe("subagent-done.ts", () => {
       });
     });
 
-    it("treats zero/negative/non-number/throwing getters as 0", () => {
+    it("accepts only known non-negative safe integer counts", () => {
       withGlobal(() => 0, () => assert.equal(runningChildrenCount(), 0));
-      withGlobal(() => -1, () => assert.equal(runningChildrenCount(), 0));
-      withGlobal(() => "two", () => assert.equal(runningChildrenCount(), 0));
-      withGlobal(() => { throw new Error("boom"); }, () => assert.equal(runningChildrenCount(), 0));
+      withGlobal(() => 1, () => assert.equal(runningChildrenCount(), 1));
+      withGlobal(() => -1, () => assert.equal(runningChildrenCount(), undefined));
+      withGlobal(() => "two", () => assert.equal(runningChildrenCount(), undefined));
+      withGlobal(() => { throw new Error("boom"); }, () => assert.equal(runningChildrenCount(), undefined));
     });
   });
 
@@ -1818,6 +1832,7 @@ describe("subagent-done.ts", () => {
         },
         registerTool(t: any) { tools.push(t); },
         registerCommand() {}, registerMessageRenderer() {}, registerShortcut() {},
+        events: { emit() {} },
         sendUserMessage() {}, sendMessage() {}, getAllTools() { return []; },
       } as any;
       const saved = {

@@ -15,6 +15,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { readFileSync } from "node:fs";
 import { writePrivateFile } from "./private-files.ts";
 import { createSubagentActivityRecorder } from "./activity.ts";
 
@@ -34,17 +35,17 @@ export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
  * `agent_end` keep the session open until every child has finished and its
  * result has been delivered.
  *
- * Returns 0 when the spawning tools aren't loaded (scout/researcher, or a
- * standalone session), so those agents auto-exit exactly as before.
+ * An absent counter means zero only when spawning tools are also absent.
+ * Missing or invalid telemetry for a spawning session remains unknown.
  */
-export function runningChildrenCount(): number {
+export function runningChildrenCount(hasSpawningTools = true): number | undefined {
   const fn = (globalThis as any)[Symbol.for("pi-subagents/running-children-count")];
-  if (typeof fn !== "function") return 0;
+  if (typeof fn !== "function") return hasSpawningTools ? undefined : 0;
   try {
     const n = fn();
-    return typeof n === "number" && n > 0 ? n : 0;
+    return typeof n === "number" && Number.isSafeInteger(n) && n >= 0 ? n : undefined;
   } catch {
-    return 0;
+    return undefined;
   }
 }
 
@@ -176,6 +177,29 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
+  const rootStateFile = process.env.PI_SUBAGENT_ROOT_STATE_FILE;
+  const emitRootGroupState = () => {
+    if (!rootStateFile) return;
+    let state: { runId?: string; state?: string };
+    try { state = JSON.parse(readFileSync(rootStateFile, "utf8")); }
+    catch { state = {}; }
+    pi.events.emit("pi-interactive-subagents:root-group-state", {
+      rootRunId: state.runId,
+      state: state.state === "open" || state.state === "closed" ? state.state : "unknown",
+    });
+  };
+  const lifecycleFile = process.env.PI_SUBAGENT_LIFECYCLE_FILE;
+  let lifecycleSequence = 0;
+  const writeLifecycle = (state: "running" | "settled") => {
+    if (!lifecycleFile) return false;
+    try {
+      writePrivateFile(lifecycleFile, JSON.stringify({ childId: process.env.PI_SUBAGENT_ID, sequence: lifecycleSequence, state }));
+      return true;
+    } catch {
+      // The parent treats missing or malformed evidence as unknown and retains its lease.
+      return false;
+    }
+  };
   let userTookOver = false;
   let agentStarted = false;
   // Set when ask_question is called; suppresses auto-exit so the session stays
@@ -195,6 +219,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("input", () => {
+    emitRootGroupState();
     recorder.input();
     // A submitted message is the orchestrator's (or a human's) reply — the
     // pending ask_question has been answered, however it was delivered. Clear
@@ -212,10 +237,13 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", () => {
+    emitRootGroupState();
     recorder.beforeAgentStart();
   });
 
   pi.on("agent_start", () => {
+    lifecycleSequence++;
+    writeLifecycle("running");
     agentStarted = true;
     // A new turn is starting — any pending ask_question has now been answered
     // (or superseded), so let auto-exit resume normally when this turn ends.
@@ -226,23 +254,33 @@ export default function (pi: ExtensionAPI) {
   let lastMessages: any[] | undefined;
   pi.on("agent_end", (event) => { lastMessages = event.messages; });
   pi.on("agent_settled", (event, ctx) => {
+    const childrenCount = runningChildrenCount(pi.getAllTools().some(tool =>
+      tool.name === "subagent" || tool.name === "subagent_message",
+    ));
     const messages = lastMessages;
     if (event.aborted) return;
     // Never shut down while this session still has work in flight:
     //  - awaitingAnswer: an ask_question is pending the orchestrator's reply.
-    //  - runningChildrenCount(): this subagent spawned its own children and is
-    //    waiting for their results (delivered as steered turns). Exiting now
-    //    would strand those children and drop their results.
+    //  - A known positive child count means it is waiting for descendant results;
+    //    an unknown count is also not evidence that shutdown is safe.
     // In both cases the session parks as `waiting` and resumes when the next
     // turn lands.
-    const hasPendingChildren = runningChildrenCount() > 0;
     const shouldExit =
       !awaitingAnswer &&
-      !hasPendingChildren &&
+      childrenCount === 0 &&
       autoExit &&
       shouldAutoExitOnAgentEnd(userTookOver, messages);
 
     if (shouldExit) {
+      if (writeLifecycle("settled")) {
+        const rootRunId = process.env.PI_AUTONOMY_CHILD_ROOT_RUN_ID;
+        const childId = process.env.PI_SUBAGENT_ID;
+        if (rootRunId && childId) {
+          pi.events.emit("pi-interactive-subagents:child-lifecycle", {
+            rootRunId, childId, state: "settled",
+          });
+        }
+      }
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
       // overload, etc.) to the parent via the .exit sidecar so the watcher
       // can report a clear failure with the underlying error message.

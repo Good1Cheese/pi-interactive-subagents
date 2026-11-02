@@ -677,7 +677,22 @@ interface RunningSubagent {
    * subagent's pane (e.g. planner).
    */
   interactive: boolean;
+  nativeRootSessionId?: string;
+  nativeRootRunId?: string;
+  nativeLifecycleFile?: string;
+  nativeLifecycleSequence?: number;
+  nativeLifecycleState?: "running" | "settled";
 }
+
+type NativeChildLifecycle = {
+  rootSessionId: string;
+  rootRunId?: string;
+  childId: string;
+  childSessionFile: string;
+  state: "started" | "settled" | "unknown";
+  sequence?: number;
+};
+const nativeChildLifecycle = new Map<string, NativeChildLifecycle>();
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
@@ -944,8 +959,39 @@ function activityLabel(activity: SubagentActivityState): string | undefined {
   return activity.activeScope;
 }
 
+function observeNativeChildLifecycle(running: RunningSubagent) {
+  if (!running.nativeLifecycleFile) return;
+  let value: any;
+  try { value = JSON.parse(readFileSync(running.nativeLifecycleFile, "utf8")); }
+  catch { return; }
+  if (value?.childId !== running.id || !Number.isSafeInteger(value.sequence) || value.sequence < 1) return;
+  if (value.sequence === running.nativeLifecycleSequence && value.state === running.nativeLifecycleState) return;
+  if (value.state !== "running" && value.state !== "settled") return;
+  running.nativeLifecycleSequence = value.sequence;
+  running.nativeLifecycleState = value.state;
+  const state = value.state === "settled" ? "settled" : "started";
+  const previous = nativeChildLifecycle.get(running.id);
+  if (previous) previous.state = state;
+  emitNativeChildLifecycle(running, state);
+}
+
+function emitNativeChildLifecycle(running: RunningSubagent, state: "started" | "settled" | "unknown" | "process_closed") {
+  if (!running.nativeRootSessionId) return;
+  const entry = nativeChildLifecycle.get(running.id);
+  if (entry && state !== "settled" && !(state === "process_closed" && entry.state === "settled"))
+    entry.state = state === "started" ? "started" : "unknown";
+  latestPi?.events.emit("pi-interactive-subagents:child-lifecycle", {
+    rootSessionId: running.nativeRootSessionId,
+    rootRunId: running.nativeRootRunId,
+    childId: running.id,
+    childSessionFile: running.sessionFile,
+    state,
+  });
+}
+
 function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now()) {
   if (running.cli === "claude") return;
+  observeNativeChildLifecycle(running);
 
   const activityFile = running.activityFile;
   const read: ActivityReadResult = activityFile
@@ -1273,7 +1319,6 @@ async function launchSubagent(
   if (!sessionFile) throw new Error("No session file");
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
-  ensurePrivateDir(artifactDir);
 
   const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
@@ -1291,16 +1336,32 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
-  // Use pre-created surface (parallel mode) or create a new one.
-  // For new surfaces, pause briefly so the shell is ready before sending the command.
-  const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
-  try {
-  if (!surfacePreCreated) await waitForShell(options.signal);
-  options.signal.throwIfAborted();
-
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
+  const nativeRootStateFile = join(artifactDir, `native-root-${sessionId}.json`);
+  const [effectiveProvider, ...effectiveModelParts] = (effectiveModel ?? "").split("/");
+  const nativeLaunchRequest: { provided?: boolean; failure?: string; rootSessionId: string; rootRunId?: string; childId: string; childSessionFile: string; rootStateFile: string; extensions: string[]; env: Record<string, string>; provider?: string; model?: string } = {
+    provided: false,
+    rootSessionId: sessionId,
+    childId: id,
+    childSessionFile: subagentSessionFile,
+    rootStateFile: nativeRootStateFile,
+    extensions: [],
+    env: {},
+    provider: effectiveModelParts.length > 0 ? effectiveProvider : undefined,
+    model: effectiveModelParts.length > 0 ? effectiveModelParts.join("/") : effectiveModel,
+  };
+  latestPi?.events.emit("pi-interactive-subagents:prepare-child", nativeLaunchRequest);
+  if (nativeLaunchRequest.failure) throw new Error(nativeLaunchRequest.failure);
+  const nativeExtensions = nativeLaunchRequest.extensions.map((path) => {
+    if (!existsSync(path)) throw new Error(`Native launch extension missing: ${path}`);
+    return realpathSync(path);
+  });
+  if (nativeLaunchRequest.provided && (!nativeLaunchRequest.rootRunId || !nativeLaunchRequest.provider || !nativeLaunchRequest.model || nativeExtensions.length === 0))
+    throw new Error("Native launch context is incomplete; no child was started.");
 
+  ensurePrivateDir(artifactDir);
+  const activityFile = getSubagentActivityFile(artifactDir, id);
+  ensurePrivateDir(dirname(activityFile));
   if (launchBehavior.seededSessionMode) {
     seedSubagentSessionFile({
       mode: launchBehavior.seededSessionMode,
@@ -1310,8 +1371,16 @@ async function launchSubagent(
     });
   }
 
-  const activityFile = getSubagentActivityFile(artifactDir, id);
-  ensurePrivateDir(dirname(activityFile));
+  // Use pre-created surface (parallel mode) or create a new one only after native admission.
+  // For new surfaces, pause briefly so the shell is ready before sending the command.
+  const surfacePreCreated = !!options?.surface;
+  const surface = options?.surface ?? createSurface(params.name);
+  try {
+  if (!surfacePreCreated) await waitForShell(options.signal);
+  options.signal.throwIfAborted();
+  const nativeLaunchEnv = nativeLaunchRequest.provided
+    ? { ...nativeLaunchRequest.env, PI_SUBAGENT_ROOT_STATE_FILE: nativeLaunchRequest.rootStateFile }
+    : nativeLaunchRequest.env;
   const { inheritsConversationContext } = launchBehavior;
 
   // Build the task message
@@ -1436,9 +1505,9 @@ async function launchSubagent(
   const loadout: SubagentLoadout = {
     agent: params.agent ?? null,
     toolAllowlist,
-    extensionAllowlist: configuredExtensions(),
+    extensionAllowlist: [...new Set([...configuredExtensions(), ...nativeExtensions])],
     toolExtensions: [...new Set(toolAllowlist.split(",").map(getToolExtensionPath).filter((p): p is string => !!p && existsSync(p)).map((p) => realpathSync(p)))],
-    model: effectiveModel ?? null,
+    model: nativeLaunchRequest.provided ? `${nativeLaunchRequest.provider}/${nativeLaunchRequest.model}` : effectiveModel ?? null,
     thinking: effectiveThinking ?? null,
     systemPromptMode: systemPromptMode ?? null,
     identity: identityInSystemPrompt ? identity : null,
@@ -1446,6 +1515,7 @@ async function launchSubagent(
     autoExit: agentDefs?.autoExit ?? false,
     cwd: effectiveCwd ?? null,
     agentDir: resolvedAgentDir,
+    ...(nativeLaunchRequest.provided ? { launchEnv: nativeLaunchEnv } : {}),
   };
   writeSubagentLoadout(subagentSessionFile, loadout);
 
@@ -1476,7 +1546,16 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
+  if (nativeLaunchRequest.provided)
+    envParts.push(`PI_SUBAGENT_LIFECYCLE_FILE=${shellEscape(`${subagentSessionFile}.native-lifecycle`)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
+  if (nativeLaunchRequest.provided) {
+    for (const [key, value] of Object.entries(nativeLaunchEnv)) {
+      if (!/^[A-Z_][A-Z0-9_]*$/.test(key) || typeof value !== "string")
+        throw new Error(`Invalid native launch environment key: ${key}`);
+      envParts.push(`${key}=${shellEscape(value)}`);
+    }
+  }
   const envPrefix = envParts.join(" ") + " ";
 
   // Pass task and skill prompts to the sub-agent.
@@ -1538,6 +1617,11 @@ async function launchSubagent(
     launchScriptFile,
     activityFile,
     interactive: effectiveInteractive,
+    ...(nativeLaunchRequest.provided ? {
+      nativeRootSessionId: sessionId,
+      nativeRootRunId: nativeLaunchRequest.rootRunId,
+      nativeLifecycleFile: `${subagentSessionFile}.native-lifecycle`,
+    } : {}),
     statusState: createStatusState({
       source: "pi",
       startTimeMs: startTime,
@@ -1546,8 +1630,16 @@ async function launchSubagent(
 
   registerName(artifactDir, running.name, { sessionFile: running.sessionFile, sessionId: getSessionId(running.sessionFile) });
   runningSubagents.set(id, running);
+  if (nativeLaunchRequest.provided) {
+    nativeChildLifecycle.set(id, { rootSessionId: sessionId, rootRunId: nativeLaunchRequest.rootRunId, childId: id, childSessionFile: subagentSessionFile, state: "started" });
+    emitNativeChildLifecycle(running, "started");
+  }
   return running;
   } catch (error) {
+    if (nativeLaunchRequest?.rootRunId) {
+      nativeChildLifecycle.set(id, { rootSessionId: sessionId, rootRunId: nativeLaunchRequest.rootRunId, childId: id, childSessionFile: subagentSessionFile, state: "unknown" });
+      latestPi?.events.emit("pi-interactive-subagents:child-lifecycle", { rootSessionId: sessionId, rootRunId: nativeLaunchRequest.rootRunId, childId: id, childSessionFile: subagentSessionFile, state: "unknown" });
+    }
     try { closeSurface(surface); } catch {}
     throw error;
   }
@@ -1639,6 +1731,8 @@ async function watchSubagent(
     });
 
     signal.throwIfAborted();
+    observeNativeChildLifecycle(running);
+    emitNativeChildLifecycle(running, "process_closed");
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
     if (running.cli === "claude") {
@@ -1746,9 +1840,27 @@ async function watchSubagent(
 
 export default function subagentsExtension(pi: ExtensionAPI) {
   latestPi = pi;
+  pi.events.on("pi-interactive-subagents:children-snapshot", (raw) => {
+    const event = raw as { rootRunId?: string; closing?: boolean; children?: Array<{ childId: string; state: string }>; responded?: boolean };
+    if (!event.rootRunId) return;
+    for (const child of nativeChildLifecycle.values()) {
+      if (child.rootRunId !== event.rootRunId) continue;
+      const running = runningSubagents.get(child.childId);
+      if (running) observeNativeChildLifecycle(running);
+    }
+    const children = [...nativeChildLifecycle.values()].filter((child) => child.rootRunId === event.rootRunId);
+    event.children = children.map((child) => ({ childId: child.childId, state: child.state }));
+    event.responded = true;
+    if (event.closing && children.length > 0 && children.every((child) => child.state === "settled")) {
+      queueMicrotask(() => {
+        for (const child of children) nativeChildLifecycle.delete(child.childId);
+      });
+    }
+  });
   // Capture the UI context for widget updates
   pi.on("session_start", (event, ctx) => {
     latestCtx = ctx;
+    pi.events.emit("pi-interactive-subagents:ready", { rootSessionId: ctx.sessionManager.getSessionId() });
     if (lifecycleAbort.signal.aborted) lifecycleAbort = new AbortController();
     // pi runs multiple sessions in one process. A prior session's shutdown
     // aborts the shared module poll-abort controller; install a fresh one so
@@ -2274,8 +2386,51 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             `Permissions cannot be inferred safely. Spawn a fresh subagent and supply any required context explicitly.`;
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
+        if (loadout.launchEnv?.PI_AUTONOMY_CHILD_ROOT_RUN_ID) {
+          try {
+            const lifecycle = JSON.parse(readFileSync(`${sessionPath}.native-lifecycle`, "utf8"));
+            if (
+              lifecycle?.state === "settled" &&
+              Number.isSafeInteger(lifecycle.sequence) && lifecycle.sequence > 0 &&
+              typeof lifecycle.childId === "string" && lifecycle.childId.length > 0
+            ) {
+              const err = `Cannot resume settled managed child "${requestedName}"; spawn a fresh child generation instead.`;
+              return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+            }
+          } catch {
+            // Missing or malformed lifecycle evidence is not positive settlement.
+          }
+        }
 
         const resumedSessionId = entry.sessionId ?? getSessionId(sessionPath) ?? requestedName;
+        const resumeModel = loadout.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "");
+        const [resumeProvider, ...resumeModelParts] = resumeModel.split("/");
+        const nativeLaunchRequest = {
+          provided: false,
+          failure: undefined as string | undefined,
+          rootSessionId: ctx.sessionManager.getSessionId(),
+          rootRunId: loadout.launchEnv?.PI_AUTONOMY_CHILD_ROOT_RUN_ID,
+          childId: id,
+          childSessionFile: sessionPath,
+          rootStateFile: join(parentArtifactDir, `native-root-${ctx.sessionManager.getSessionId()}.json`),
+          extensions: [] as string[],
+          env: {} as Record<string, string>,
+          provider: resumeModelParts.length ? resumeProvider : undefined,
+          model: resumeModelParts.length ? resumeModelParts.join("/") : resumeModel,
+        };
+        latestPi?.events.emit("pi-interactive-subagents:prepare-child", nativeLaunchRequest);
+        if (nativeLaunchRequest.failure) {
+          return { content: [{ type: "text" as const, text: nativeLaunchRequest.failure }], details: { error: nativeLaunchRequest.failure } };
+        }
+
+        if (nativeLaunchRequest.provided) {
+          const extensions = nativeLaunchRequest.extensions.map((path) => realpathSync(path));
+          if (!nativeLaunchRequest.rootRunId || !nativeLaunchRequest.provider || !nativeLaunchRequest.model || extensions.length === 0)
+            throw new Error("Native resume context is incomplete; no child was started.");
+          loadout.model = `${nativeLaunchRequest.provider}/${nativeLaunchRequest.model}`;
+          loadout.extensionAllowlist = [...new Set([...(loadout.extensionAllowlist ?? []), ...extensions])];
+          loadout.launchEnv = { ...nativeLaunchRequest.env, PI_SUBAGENT_ROOT_STATE_FILE: nativeLaunchRequest.rootStateFile };
+        }
 
         // Record entry count before resuming so we can extract new messages.
         // Count lines cheaply (no per-line JSON.parse) so resuming a large
@@ -2345,8 +2500,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
+        if (loadout.launchEnv?.PI_AUTONOMY_CHILD_ROOT_RUN_ID)
+          resumeEnvParts.push(`PI_SUBAGENT_LIFECYCLE_FILE=${shellEscape(`${sessionPath}.native-lifecycle`)}`);
         if (autoExit) {
           resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
+        }
+        for (const [key, value] of Object.entries(loadout.launchEnv ?? {})) {
+          if (/^[A-Z_][A-Z0-9_]*$/.test(key) && typeof value === "string")
+            resumeEnvParts.push(`${key}=${shellEscape(value)}`);
         }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
@@ -2381,13 +2542,27 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           launchScriptFile,
           activityFile,
           interactive,
+          ...(loadout.launchEnv?.PI_AUTONOMY_CHILD_ROOT_RUN_ID ? {
+            nativeRootSessionId: sessionId,
+            nativeRootRunId: loadout.launchEnv.PI_AUTONOMY_CHILD_ROOT_RUN_ID,
+            nativeLifecycleFile: `${sessionPath}.native-lifecycle`,
+          } : {}),
           statusState: createStatusState({
             source: "pi",
             startTimeMs: startTime,
           }),
         };
         runningSubagents.set(id, running);
+        if (running.nativeRootRunId) {
+          nativeChildLifecycle.set(id, { rootSessionId: sessionId, rootRunId: running.nativeRootRunId, childId: id, childSessionFile: sessionPath, state: "started" });
+          emitNativeChildLifecycle(running, "started");
+        }
         } catch (error) {
+          const rootRunId = loadout.launchEnv?.PI_AUTONOMY_CHILD_ROOT_RUN_ID;
+          if (rootRunId) {
+            nativeChildLifecycle.set(id, { rootSessionId: ctx.sessionManager.getSessionId(), rootRunId, childId: id, childSessionFile: sessionPath, state: "unknown" });
+            latestPi?.events.emit("pi-interactive-subagents:child-lifecycle", { rootSessionId: ctx.sessionManager.getSessionId(), rootRunId, childId: id, childSessionFile: sessionPath, state: "unknown" });
+          }
           if (surface) { try { closeSurface(surface); } catch {} }
           throw error;
         } finally {
